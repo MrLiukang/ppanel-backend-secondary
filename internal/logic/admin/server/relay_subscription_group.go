@@ -593,9 +593,23 @@ func subscriptionRelayRuleID(groupID int64, ruleID string) string {
 }
 
 func mergeSubscriptionRelayRules(existing []types.NodeRelayRule, groups map[int64][]types.NodeRelayRule) ([]types.NodeRelayRule, error) {
+	legacyOwnedRules := make(map[types.NodeRelayRule]struct{})
+	for groupID, rules := range groups {
+		derived := sidecarRelayRules(rules, groupID)
+		for index, candidate := range derived {
+			if candidate.TargetProtocol != "socks" || candidate.TargetAddress != "127.0.0.1" || candidate.TargetPort <= 0 {
+				continue
+			}
+			candidate.ID = rules[index].ID
+			legacyOwnedRules[candidate] = struct{}{}
+		}
+	}
 	manualRules := make([]types.NodeRelayRule, 0, len(existing))
 	for _, rule := range existing {
 		if strings.HasPrefix(rule.ID, subscriptionRelayRulePrefix) {
+			continue
+		}
+		if _, legacyOwned := legacyOwnedRules[rule]; legacyOwned {
 			continue
 		}
 		manualRules = append(manualRules, rule)

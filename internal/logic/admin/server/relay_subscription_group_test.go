@@ -241,6 +241,42 @@ func TestMergeSubscriptionRelayRulesExactCollisionNeverDeletesManualRule(t *test
 	}
 }
 
+func TestMergeSubscriptionRelayRulesMigratesExactLegacyDerivedRule(t *testing.T) {
+	raw := types.NodeRelayRule{
+		ID:                  "owned",
+		Enabled:             true,
+		ListenPort:          643,
+		Network:             "tcp,udp",
+		TargetAddress:       "upstream.example",
+		TargetPort:          443,
+		TargetProtocol:      "anytls",
+		TargetSecurity:      "tls",
+		TargetSNI:           "example.com",
+		TargetPassword:      "secret",
+		TargetAllowInsecure: true,
+	}
+	legacy := sidecarRelayRules([]types.NodeRelayRule{raw}, 7)[0]
+	legacy.ID = raw.ID
+	manual := types.NodeRelayRule{ID: "manual", ListenPort: 744, TargetProtocol: "tcp", TargetAddress: "manual.example", TargetPort: 443}
+
+	got, err := mergeSubscriptionRelayRules([]types.NodeRelayRule{manual, legacy}, map[int64][]types.NodeRelayRule{7: {raw}})
+	if err != nil {
+		t.Fatalf("mergeSubscriptionRelayRules() error = %v", err)
+	}
+	if len(got) != 2 || got[0] != manual {
+		t.Fatalf("merged rules = %#v, want manual rule followed by one managed rule", got)
+	}
+	if got[1].ID != subscriptionRelayRuleID(7, raw.ID) {
+		t.Fatalf("managed rule ID = %q", got[1].ID)
+	}
+
+	nearMatch := legacy
+	nearMatch.TargetPort++
+	if _, err := mergeSubscriptionRelayRules([]types.NodeRelayRule{nearMatch}, map[int64][]types.NodeRelayRule{7: {raw}}); err == nil || !strings.Contains(err.Error(), "legacy migration conflict") {
+		t.Fatalf("near-match migration error = %v, want conflict", err)
+	}
+}
+
 func TestRelaySubscriptionRulesRevisionIsStableAndTracksRuntimeChanges(t *testing.T) {
 	rules := []types.NodeRelayRule{{ID: "same", Enabled: true, ListenPort: 643, TargetProtocol: "vless", TargetAddress: "old.example", TargetPort: 443}}
 	first, err := relaySubscriptionRulesRevision(rules)
