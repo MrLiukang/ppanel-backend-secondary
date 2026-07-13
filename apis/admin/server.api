@@ -114,6 +114,32 @@ type (
 		ServerID int64 `json:"server_id" validate:"required"`
 		ServerNodeConfigOverride
 	}
+	SubscriptionRelayPreviewSkipEntry {
+		Name   string `json:"name"`
+		Reason string `json:"reason"`
+	}
+	SubscriptionRelayPreviewResponse {
+		Rules        []NodeRelayRule                     `json:"rules"`
+		Skipped      []SubscriptionRelayPreviewSkipEntry `json:"skipped"`
+		PreviewToken string                              `json:"preview_token"`
+	}
+	RelaySubscriptionGroupRequest {
+		Id              int64  `json:"id"`
+		ServerID        int64  `json:"server_id"`
+		Name            string `json:"name"`
+		URL             string `json:"url"`
+		Enabled         bool   `json:"enabled"`
+		AutoUpdate      bool   `json:"auto_update"`
+		UpdateInterval  int    `json:"update_interval"`
+		ListenPortStart int    `json:"listen_port_start"`
+		ListenPortStep  int    `json:"listen_port_step"`
+	}
+	RelaySubscriptionGroupApplyRequest {
+		Id           int64           `json:"id" validate:"required"`
+		ServerID     int64           `json:"server_id" validate:"required"`
+		Rules        []NodeRelayRule `json:"rules" validate:"required"`
+		PreviewToken string          `json:"preview_token" validate:"required"`
+	}
 	Node {
 		Id        int64    `json:"id"`
 		Name      string   `json:"name"`
@@ -211,6 +237,14 @@ service ppanel {
 	@doc "Update Server Node Config"
 	@handler UpdateServerNodeConfig
 	post /node_config/update (UpdateServerNodeConfigRequest)
+
+	@doc "Preview relay subscription group"
+	@handler PreviewRelaySubscriptionGroup
+	post /relay/subscription/group/preview (RelaySubscriptionGroupRequest) returns (SubscriptionRelayPreviewResponse)
+
+	@doc "Apply relay subscription group"
+	@handler ApplyRelaySubscriptionGroup
+	post /relay/subscription/group/apply (RelaySubscriptionGroupApplyRequest)
 
 	@doc "Create Node"
 	@handler CreateNode

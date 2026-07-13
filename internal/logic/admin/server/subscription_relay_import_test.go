@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/perfect-panel/server/internal/types"
@@ -12,7 +13,7 @@ import (
 )
 
 func TestParseSubscriptionRelayRulesMapsVlessXhttpTLS(t *testing.T) {
-	raw := base64.StdEncoding.EncodeToString([]byte("vless://11111111-1111-1111-1111-111111111111@hk1.example.com:443?type=xhttp&security=tls&sni=update.microsoft.com&path=%2Fpath&mode=packet-up&extra=%7B%22scStreamUpServerName%22%3A%22cdn.example.com%22%7D&allowInsecure=1#HK%201"))
+	raw := base64.StdEncoding.EncodeToString([]byte("vless://11111111-1111-1111-1111-111111111111@hk1.example.com:443?type=xhttp&security=tls&sni=update.microsoft.com&path=%2Fpath&mode=packet-up#HK%201"))
 
 	rules, skipped := ParseSubscriptionRelayRules(raw, SubscriptionRelayImportOptions{
 		ListenPortStart: 643,
@@ -37,8 +38,8 @@ func TestParseSubscriptionRelayRulesMapsVlessXhttpTLS(t *testing.T) {
 	require.Equal(t, "update.microsoft.com", rules[0].TargetSNI)
 	require.Equal(t, "/path", rules[0].TargetPath)
 	require.Equal(t, "packet-up", rules[0].TargetXHTTPMode)
-	require.Equal(t, `{"scStreamUpServerName":"cdn.example.com"}`, rules[0].TargetXHTTPExtra)
-	require.True(t, rules[0].TargetAllowInsecure)
+	require.Empty(t, rules[0].TargetXHTTPExtra)
+	require.False(t, rules[0].TargetAllowInsecure)
 }
 
 func TestParseSubscriptionRelayRulesSkipsInvalidTrojanPlaceholder(t *testing.T) {
@@ -64,7 +65,6 @@ proxies:
     port: 601
     password: secret
     sni: down.example.com
-    skip-cert-verify: true
 `
 
 	rules, skipped := ParseSubscriptionRelayRules(raw, SubscriptionRelayImportOptions{
@@ -81,7 +81,60 @@ proxies:
 	require.Equal(t, 601, rules[0].TargetPort)
 	require.Equal(t, "secret", rules[0].TargetPassword)
 	require.Equal(t, "down.example.com", rules[0].TargetSNI)
-	require.True(t, rules[0].TargetAllowInsecure)
+	require.False(t, rules[0].TargetAllowInsecure)
+}
+
+func TestParseSubscriptionRelayRulesMapsClashVlessUUID(t *testing.T) {
+	raw := `proxies:
+  - name: VLESS
+    type: vless
+    server: vless.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    network: tcp
+`
+
+	rules, skipped := ParseSubscriptionRelayRules(raw, SubscriptionRelayImportOptions{})
+
+	require.Empty(t, skipped)
+	require.Len(t, rules, 1)
+	require.Equal(t, "11111111-1111-1111-1111-111111111111", rules[0].TargetUUID)
+}
+
+func TestParseSubscriptionRelayRulesSkipsUnsupportedCapabilities(t *testing.T) {
+	tests := []struct {
+		name string
+		link string
+		want string
+	}{
+		{name: "vless websocket", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls", want: "transport"},
+		{name: "vless reality", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=reality", want: "security"},
+		{name: "vless grpc", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=grpc&security=tls", want: "transport"},
+		{name: "vless flow", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&flow=xtls-rprx-vision", want: "flow"},
+		{name: "vless fingerprint", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&fp=chrome", want: "fingerprint"},
+		{name: "vless alpn", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&alpn=h2", want: "alpn"},
+		{name: "vless insecure", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&allowInsecure=1", want: "allow-insecure"},
+		{name: "vless invalid uuid", link: "vless://not-a-uuid@example.com:443?type=tcp&security=tls", want: "uuid"},
+		{name: "vless tcp host", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&host=edge.example.com", want: "host"},
+		{name: "vless tcp path", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&path=%2Fx", want: "path"},
+		{name: "vless tcp mode", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&mode=auto", want: "mode"},
+		{name: "vless xhttp extra", link: "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=tls&path=%2Fx&mode=auto&extra=%7B%7D", want: "extra"},
+		{name: "anytls password", link: "anytls://@example.com:443", want: "password"},
+		{name: "anytls insecure", link: "anytls://secret@example.com:443?allowInsecure=1", want: "allow-insecure"},
+		{name: "ss security", link: "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388?security=tls", want: "security"},
+		{name: "ss sni", link: "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388?sni=edge.example.com", want: "sni"},
+		{name: "ss transport", link: "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388?type=ws", want: "transport"},
+		{name: "ss host", link: "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388?host=edge.example.com", want: "host"},
+		{name: "ss path", link: "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388?path=%2Fws", want: "path"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rules, skipped := ParseSubscriptionRelayRules(tt.link, SubscriptionRelayImportOptions{})
+			require.Empty(t, rules)
+			require.Len(t, skipped, 1)
+			require.Contains(t, strings.ToLower(skipped[0].Reason), tt.want)
+		})
+	}
 }
 
 func TestParseSubscriptionRelayRulesMapsTrojanAndShadowsocks(t *testing.T) {
@@ -114,7 +167,7 @@ func TestParseSubscriptionRelayRulesSupportsSIP002URLSafeBase64(t *testing.T) {
 	require.Equal(t, "legacy.example.com", rules[1].TargetAddress)
 }
 
-func TestParseSubscriptionRelayRulesMapsYAMLSSAndServername(t *testing.T) {
+func TestParseSubscriptionRelayRulesMapsYAMLSS(t *testing.T) {
 	raw := `proxies:
   - name: SS
     type: ss
@@ -122,7 +175,6 @@ func TestParseSubscriptionRelayRulesMapsYAMLSSAndServername(t *testing.T) {
     port: 8388
     cipher: aes-128-gcm
     password: secret
-    servername: edge.example.com
 `
 
 	rules, skipped := ParseSubscriptionRelayRules(raw, SubscriptionRelayImportOptions{})
@@ -131,7 +183,7 @@ func TestParseSubscriptionRelayRulesMapsYAMLSSAndServername(t *testing.T) {
 	require.Len(t, rules, 1)
 	require.Equal(t, "shadowsocks", rules[0].TargetProtocol)
 	require.Equal(t, "aes-128-gcm", rules[0].TargetMethod)
-	require.Equal(t, "edge.example.com", rules[0].TargetSNI)
+	require.Empty(t, rules[0].TargetSNI)
 }
 
 func TestParseSubscriptionRelayRulesSkipsUnsupportedRuntimeCombinations(t *testing.T) {
@@ -192,7 +244,7 @@ func TestParseSubscriptionRelayRulesMapsServernameQuery(t *testing.T) {
 }
 
 func TestFetchSubscriptionRelayPreviewReadsRemoteSubscription(t *testing.T) {
-	raw := base64.StdEncoding.EncodeToString([]byte("vless://11111111-1111-1111-1111-111111111111@hk1.example.com:443?type=xhttp&security=tls&sni=update.microsoft.com&path=%2Fpath&allowInsecure=1#HK%201"))
+	raw := base64.StdEncoding.EncodeToString([]byte("vless://11111111-1111-1111-1111-111111111111@hk1.example.com:443?type=xhttp&security=tls&sni=update.microsoft.com&path=%2Fpath#HK%201"))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "clash-verge", r.Header.Get("User-Agent"))
 		_, _ = w.Write([]byte(raw))
@@ -208,7 +260,7 @@ func TestFetchSubscriptionRelayPreviewReadsRemoteSubscription(t *testing.T) {
 	require.Len(t, resp.Rules, 1)
 	require.Empty(t, resp.Skipped)
 	require.Equal(t, "hk1.example.com", resp.Rules[0].TargetAddress)
-	require.True(t, resp.Rules[0].TargetAllowInsecure)
+	require.False(t, resp.Rules[0].TargetAllowInsecure)
 }
 
 func TestSidecarRelayRulesMapsAnyTLSToLocalSOCKS(t *testing.T) {

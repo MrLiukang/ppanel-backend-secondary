@@ -21,13 +21,7 @@ func Node(ctx *svc.ServiceContext) {
 	}
 	var nodeConfig config.NodeDBConfig
 	tool.SystemConfigSliceReflectToStruct(configs, &nodeConfig)
-	c := config.NodeConfig{
-		NodeSecret:             nodeConfig.NodeSecret,
-		NodePullInterval:       nodeConfig.NodePullInterval,
-		NodePushInterval:       nodeConfig.NodePushInterval,
-		IPStrategy:             nodeConfig.IPStrategy,
-		TrafficReportThreshold: nodeConfig.TrafficReportThreshold,
-	}
+	c := nodeConfigFromDB(ctx.Config.Node, nodeConfig)
 	if nodeConfig.DNS != "" {
 		var dns []config.NodeDNS
 		err = json.Unmarshal([]byte(nodeConfig.DNS), &dns)
@@ -88,4 +82,15 @@ func Node(ctx *svc.ServiceContext) {
 		logger.Error("Unmarshal Node Multiplier Config Error: ", logger.Field("error", err.Error()), logger.Field("value", nodeMultiplierData.Value))
 	}
 	ctx.NodeMultiplierManager = nodeMultiplier.NewNodeMultiplierManager(periods)
+}
+
+func nodeConfigFromDB(current config.NodeConfig, nodeConfig config.NodeDBConfig) config.NodeConfig {
+	return config.NodeConfig{
+		NodeSecret:             nodeConfig.NodeSecret,
+		AllowLegacyNodeSecret:  current.AllowLegacyNodeSecret,
+		NodePullInterval:       nodeConfig.NodePullInterval,
+		NodePushInterval:       nodeConfig.NodePushInterval,
+		IPStrategy:             nodeConfig.IPStrategy,
+		TrafficReportThreshold: nodeConfig.TrafficReportThreshold,
+	}
 }

@@ -2,12 +2,31 @@ package httpserver
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
+	"strconv"
 	"testing"
 
 	appconfig "github.com/perfect-panel/server/internal/config"
 	"github.com/perfect-panel/server/internal/svc"
 )
+
+func TestServerTokenCannotAccessAnotherServer(t *testing.T) {
+	app := newTestServer("secret")
+	tokenA := testServerToken("secret", 1)
+	status, _ := performNativeRequest(app, http.MethodGet, "/v2/server/2?secret_key="+tokenA)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("server A token accessed server B: status %d", status)
+	}
+}
+
+func testServerToken(secret string, serverID int64) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(strconv.FormatInt(serverID, 10)))
+	return hex.EncodeToString(mac.Sum(nil))
+}
 
 func TestServerSecretMiddlewareBlocksMigratedPost(t *testing.T) {
 	app := newTestServer("secret")

@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/perfect-panel/server/internal/logic/nodeconfig"
 	"github.com/perfect-panel/server/internal/types"
 )
 
@@ -124,6 +125,7 @@ type subscriptionYAMLProxy struct {
 	Server           string    `yaml:"server"`
 	Port             yaml.Node `yaml:"port"`
 	Password         string    `yaml:"password"`
+	UUID             string    `yaml:"uuid"`
 	SNI              string    `yaml:"sni"`
 	ServerName       string    `yaml:"servername"`
 	SkipCertVerify   bool      `yaml:"skip-cert-verify"`
@@ -133,6 +135,9 @@ type subscriptionYAMLProxy struct {
 	Cipher           string    `yaml:"cipher"`
 	Plugin           string    `yaml:"plugin"`
 	PluginOpts       yaml.Node `yaml:"plugin-opts"`
+	Flow             string    `yaml:"flow"`
+	Fingerprint      string    `yaml:"client-fingerprint"`
+	ALPN             string    `yaml:"alpn"`
 }
 
 func parseSubscriptionYAML(content string, options SubscriptionRelayImportOptions) ([]types.NodeRelayRule, []SubscriptionRelaySkipEntry, bool) {
@@ -196,6 +201,10 @@ func parseSubscriptionYAML(content string, options SubscriptionRelayImportOption
 			TargetAllowInsecure: proxy.SkipCertVerify,
 			TargetXHTTPMode:     strings.TrimSpace(proxy.TargetXHTTPMode),
 			TargetXHTTPExtra:    strings.TrimSpace(proxy.TargetXHTTPExtra),
+			TargetFlow:          strings.TrimSpace(proxy.Flow),
+			TargetFingerprint:   strings.TrimSpace(proxy.Fingerprint),
+			TargetALPN:          strings.TrimSpace(proxy.ALPN),
+			TargetUUID:          strings.TrimSpace(proxy.UUID),
 			TargetMethod:        strings.TrimSpace(proxy.Cipher),
 			TargetCipher:        strings.TrimSpace(proxy.Cipher),
 			TargetPlugin:        strings.TrimSpace(proxy.Plugin),
@@ -313,6 +322,9 @@ func parseSubscriptionRelayLine(line string, listenPort int, sort int) (types.No
 		TargetPath:          strings.TrimSpace(query.Get("path")),
 		TargetXHTTPMode:     strings.TrimSpace(query.Get("mode")),
 		TargetXHTTPExtra:    strings.TrimSpace(query.Get("extra")),
+		TargetFlow:          strings.TrimSpace(query.Get("flow")),
+		TargetFingerprint:   subscriptionQueryFirst(query, "fp", "fingerprint"),
+		TargetALPN:          strings.TrimSpace(query.Get("alpn")),
 		TargetAllowInsecure: parseSubscriptionBool(query.Get("allowInsecure")),
 		TargetMethod:        strings.TrimSpace(query.Get("method")),
 		TargetCipher:        strings.TrimSpace(query.Get("cipher")),
@@ -358,46 +370,19 @@ func decodeBase64Value(value string) (string, error) {
 }
 
 func unsupportedImportedRelayRule(rule types.NodeRelayRule) string {
-	switch rule.TargetProtocol {
-	case "trojan":
-		if rule.TargetPassword == "" {
-			return "trojan password is required"
-		}
-		if rule.TargetTransport != "" && rule.TargetTransport != "tcp" {
-			return fmt.Sprintf("trojan transport %q is not supported by relay runtime", rule.TargetTransport)
-		}
-		if rule.TargetSecurity != "" && rule.TargetSecurity != "tls" {
-			return fmt.Sprintf("trojan security %q is not supported by relay runtime", rule.TargetSecurity)
-		}
-		if rule.TargetAllowInsecure {
-			return "trojan allow-insecure is not supported by relay runtime"
-		}
-	case "shadowsocks":
-		if rule.TargetPassword == "" {
-			return "shadowsocks password is required"
-		}
-		if !validImportedShadowsocksCipher(rule.TargetMethod) {
-			return fmt.Sprintf("unsupported shadowsocks cipher %q", rule.TargetMethod)
-		}
-		if rule.TargetPlugin != "" || rule.TargetPluginOpts != "" {
-			return "shadowsocks plugin is not supported by relay runtime"
-		}
-		if rule.TargetAllowInsecure {
-			return "shadowsocks allow-insecure is not supported by relay runtime"
-		}
+	if err := nodeconfig.ValidateRelayRuntimeSupport(rule); err != nil {
+		return err.Error()
 	}
 	return ""
 }
 
-func validImportedShadowsocksCipher(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "xchacha20-poly1305",
-		"aes-128-cfb", "aes-256-cfb", "chacha20", "chacha20-ietf",
-		"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305":
-		return true
-	default:
-		return false
+func subscriptionQueryFirst(query url.Values, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(query.Get(key)); value != "" {
+			return value
+		}
 	}
+	return ""
 }
 
 func displayName(u *url.URL) string {

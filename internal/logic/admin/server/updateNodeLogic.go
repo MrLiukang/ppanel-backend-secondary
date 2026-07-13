@@ -34,6 +34,9 @@ func (l *UpdateNodeLogic) UpdateNode(req *types.UpdateNodeRequest) error {
 		l.Errorw("[UpdateNode] Query Database Error: ", logger.Field("error", err.Error()))
 		return errors.Wrapf(xerr.NewErrCode(xerr.DatabaseUpdateError), "[UpdateNode] Query Database Error")
 	}
+	if err := rejectManagedRelayNode(data); err != nil {
+		return err
+	}
 	data.Name = req.Name
 	data.Tags = tool.StringSliceToString(req.Tags)
 	data.ServerId = req.ServerId

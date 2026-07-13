@@ -127,6 +127,7 @@ type SiteConfig struct {
 
 type NodeConfig struct {
 	NodeSecret             string            `yaml:"NodeSecret" default:""`
+	AllowLegacyNodeSecret  bool              `yaml:"AllowLegacyNodeSecret" default:"true"`
 	NodePullInterval       int64             `yaml:"NodePullInterval" default:"60"`
 	NodePushInterval       int64             `yaml:"NodePushInterval" default:"60"`
 	TrafficReportThreshold int64             `yaml:"TrafficReportThreshold" default:"0"`
@@ -252,6 +253,9 @@ type NodeRelayRule struct {
 	TargetPath          string `json:"target_path"`
 	TargetXHTTPMode     string `json:"target_xhttp_mode"`
 	TargetXHTTPExtra    string `json:"target_xhttp_extra"`
+	TargetFlow          string `json:"target_flow"`
+	TargetFingerprint   string `json:"target_fingerprint"`
+	TargetALPN          string `json:"target_alpn"`
 	TargetUUID          string `json:"target_uuid"`
 	TargetPassword      string `json:"target_password"`
 	TargetMethod        string `json:"target_method"`

@@ -1346,6 +1346,9 @@ type NodeRelayRule struct {
 	TargetPath          string `json:"target_path"`
 	TargetXHTTPMode     string `json:"target_xhttp_mode"`
 	TargetXHTTPExtra    string `json:"target_xhttp_extra"`
+	TargetFlow          string `json:"target_flow"`
+	TargetFingerprint   string `json:"target_fingerprint"`
+	TargetALPN          string `json:"target_alpn"`
 	TargetUUID          string `json:"target_uuid"`
 	TargetPassword      string `json:"target_password"`
 	TargetMethod        string `json:"target_method"`
@@ -1821,8 +1824,9 @@ type SubscriptionRelayPreviewSkipEntry struct {
 }
 
 type SubscriptionRelayPreviewResponse struct {
-	Rules   []NodeRelayRule                     `json:"rules"`
-	Skipped []SubscriptionRelayPreviewSkipEntry `json:"skipped"`
+	Rules        []NodeRelayRule                     `json:"rules"`
+	Skipped      []SubscriptionRelayPreviewSkipEntry `json:"skipped"`
+	PreviewToken string                              `json:"preview_token"`
 }
 
 type RelaySubscriptionGroup struct {
@@ -1878,9 +1882,10 @@ type RelaySubscriptionGroupHealthRequest struct {
 }
 
 type RelaySubscriptionGroupApplyRequest struct {
-	Id       int64           `json:"id" validate:"required"`
-	ServerID int64           `json:"server_id" validate:"required"`
-	Rules    []NodeRelayRule `json:"rules" validate:"required"`
+	Id           int64           `json:"id" validate:"required"`
+	ServerID     int64           `json:"server_id" validate:"required"`
+	Rules        []NodeRelayRule `json:"rules" validate:"required"`
+	PreviewToken string          `json:"preview_token" validate:"required"`
 }
 
 type QuerySubscribeGroupListResponse struct {

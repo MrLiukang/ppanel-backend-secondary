@@ -8,12 +8,13 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/mysql"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/database/sqlite"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/perfect-panel/server/pkg/logger"
 	"github.com/perfect-panel/server/pkg/orm"
 )
 
-//go:embed database/mysql/*.sql database/postgres/*.sql
+//go:embed database/mysql/*.sql database/postgres/*.sql database/sqlite/*.sql
 var sqlFiles embed.FS
 var NoChange = migrate.ErrNoChange
 
@@ -27,6 +28,9 @@ func Migrate(driver, dsn string) *migrate.Migrate {
 	case orm.DriverPostgres:
 		sourcePath = "database/postgres"
 		databaseURL = ensureScheme(orm.DriverPostgres, dsn)
+	case "sqlite", "sqlite3":
+		sourcePath = "database/sqlite"
+		databaseURL = ensureScheme("sqlite", dsn)
 	default:
 		logger.Errorf("[Migrate] unsupported database driver: %s", driver)
 		panic(fmt.Errorf("unsupported database driver: %s", driver))

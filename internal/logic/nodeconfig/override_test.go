@@ -322,6 +322,25 @@ func TestValidateRelayRulesRejectsUnsupportedRuntimeCombinations(t *testing.T) {
 		{name: "ss password", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetMethod: "aes-256-gcm"}, want: "password"},
 		{name: "ss cipher", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "invalid"}, want: "cipher"},
 		{name: "ss plugin", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "aes-256-gcm", TargetPlugin: "obfs-local"}, want: "plugin"},
+		{name: "ss security", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "aes-256-gcm", TargetSecurity: "tls"}, want: "security"},
+		{name: "ss sni", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "aes-256-gcm", TargetSNI: "edge.example.com"}, want: "sni"},
+		{name: "ss transport", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "aes-256-gcm", TargetTransport: "ws"}, want: "transport"},
+		{name: "ss host", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "aes-256-gcm", TargetHost: "edge.example.com"}, want: "host"},
+		{name: "ss path", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "aes-256-gcm", TargetPath: "/ws"}, want: "path"},
+		{name: "anytls password", rule: types.NodeRelayRule{TargetProtocol: "anytls"}, want: "password"},
+		{name: "anytls insecure", rule: types.NodeRelayRule{TargetProtocol: "anytls", TargetPassword: "secret", TargetAllowInsecure: true}, want: "allow-insecure"},
+		{name: "vless password", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetTransport: "tcp"}, want: "uuid"},
+		{name: "vless invalid uuid", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "not-a-uuid", TargetTransport: "tcp"}, want: "uuid"},
+		{name: "vless websocket", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "ws"}, want: "transport"},
+		{name: "vless reality", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "tcp", TargetSecurity: "reality"}, want: "security"},
+		{name: "vless flow", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "tcp", TargetFlow: "xtls-rprx-vision"}, want: "flow"},
+		{name: "vless fingerprint", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "tcp", TargetFingerprint: "chrome"}, want: "fingerprint"},
+		{name: "vless alpn", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "tcp", TargetALPN: "h2"}, want: "alpn"},
+		{name: "vless insecure", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "tcp", TargetAllowInsecure: true}, want: "allow-insecure"},
+		{name: "vless tcp host", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "tcp", TargetHost: "edge.example.com"}, want: "host"},
+		{name: "vless tcp path", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "tcp", TargetPath: "/x"}, want: "path"},
+		{name: "vless tcp mode", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "tcp", TargetXHTTPMode: "auto"}, want: "mode"},
+		{name: "vless xhttp extra", rule: types.NodeRelayRule{TargetProtocol: "vless", TargetUUID: "11111111-1111-1111-1111-111111111111", TargetTransport: "xhttp", TargetPath: "/x", TargetXHTTPMode: "auto", TargetXHTTPExtra: "{}"}, want: "extra"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -343,6 +362,8 @@ func TestValidateRelayRulesAcceptsBasicTrojanAndShadowsocks(t *testing.T) {
 	err := ValidateRelayRules([]types.NodeRelayRule{
 		{ID: "trojan", Enabled: true, ListenPort: 643, Network: "tcp,udp", TargetAddress: "trojan.example.com", TargetPort: 443, TargetProtocol: "trojan", TargetSecurity: "tls", TargetTransport: "tcp", TargetPassword: "secret"},
 		{ID: "ss", Enabled: true, ListenPort: 743, Network: "tcp,udp", TargetAddress: "ss.example.com", TargetPort: 8388, TargetProtocol: "shadowsocks", TargetMethod: "aes-256-gcm", TargetPassword: "secret"},
+		{ID: "vless-tcp", Enabled: true, ListenPort: 843, Network: "tcp,udp", TargetAddress: "vless.example.com", TargetPort: 443, TargetProtocol: "vless", TargetSecurity: "tls", TargetTransport: "tcp", TargetUUID: "11111111-1111-1111-1111-111111111111"},
+		{ID: "vless-xhttp", Enabled: true, ListenPort: 943, Network: "tcp,udp", TargetAddress: "xhttp.example.com", TargetPort: 443, TargetProtocol: "vless", TargetSecurity: "tls", TargetTransport: "xhttp", TargetPath: "/x", TargetXHTTPMode: "auto", TargetUUID: "11111111-1111-1111-1111-111111111111"},
 	})
 	if err != nil {
 		t.Fatalf("ValidateRelayRules() error = %v", err)
@@ -368,6 +389,7 @@ func TestValidateRelayRulesAcceptsAnyTLS(t *testing.T) {
 			TargetAddress:  "hk.example.com",
 			TargetPort:     6443,
 			TargetProtocol: "anytls",
+			TargetPassword: "secret",
 		},
 	})
 	if err != nil {

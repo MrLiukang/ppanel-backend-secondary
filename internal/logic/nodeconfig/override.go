@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gofrs/uuid/v5"
 	"github.com/perfect-panel/server/internal/config"
 	"github.com/perfect-panel/server/internal/model/node"
 	"github.com/perfect-panel/server/internal/types"
@@ -443,6 +444,9 @@ func NormalizeRelayRules(values []types.NodeRelayRule) []types.NodeRelayRule {
 			TargetPath:          strings.TrimSpace(item.TargetPath),
 			TargetXHTTPMode:     strings.TrimSpace(item.TargetXHTTPMode),
 			TargetXHTTPExtra:    strings.TrimSpace(item.TargetXHTTPExtra),
+			TargetFlow:          strings.TrimSpace(item.TargetFlow),
+			TargetFingerprint:   strings.TrimSpace(item.TargetFingerprint),
+			TargetALPN:          strings.TrimSpace(item.TargetALPN),
 			TargetUUID:          strings.TrimSpace(item.TargetUUID),
 			TargetPassword:      strings.TrimSpace(item.TargetPassword),
 			TargetMethod:        strings.TrimSpace(item.TargetMethod),
@@ -487,15 +491,69 @@ func ValidateRelayRules(rules []types.NodeRelayRule) error {
 		if !validRoutingNetwork(rule.Network) {
 			return fmt.Errorf("relay rule %q has invalid network %q", rule.ID, rule.Network)
 		}
-		if err := validateRelayRuntimeSupport(rule); err != nil {
+		if err := ValidateRelayRuntimeSupport(rule); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateRelayRuntimeSupport(rule types.NodeRelayRule) error {
+func ValidateRelayRuntimeSupport(rule types.NodeRelayRule) error {
+	normalized := NormalizeRelayRules([]types.NodeRelayRule{rule})
+	if len(normalized) == 0 {
+		return nil
+	}
+	rule = normalized[0]
 	switch rule.TargetProtocol {
+	case "vless":
+		if rule.TargetUUID == "" {
+			return fmt.Errorf("relay rule %q vless uuid is required", rule.ID)
+		}
+		if _, err := uuid.FromString(rule.TargetUUID); err != nil {
+			return fmt.Errorf("relay rule %q vless uuid is invalid", rule.ID)
+		}
+		if rule.TargetTransport != "" && rule.TargetTransport != "tcp" && rule.TargetTransport != "xhttp" {
+			return fmt.Errorf("relay rule %q vless transport %q is not supported", rule.ID, rule.TargetTransport)
+		}
+		if rule.TargetSecurity != "" && rule.TargetSecurity != "tls" {
+			return fmt.Errorf("relay rule %q vless security %q is not supported", rule.ID, rule.TargetSecurity)
+		}
+		if rule.TargetFlow != "" {
+			return fmt.Errorf("relay rule %q vless flow is not supported", rule.ID)
+		}
+		if rule.TargetFingerprint != "" {
+			return fmt.Errorf("relay rule %q vless fingerprint is not supported", rule.ID)
+		}
+		if rule.TargetALPN != "" {
+			return fmt.Errorf("relay rule %q vless alpn is not supported", rule.ID)
+		}
+		if rule.TargetAllowInsecure {
+			return fmt.Errorf("relay rule %q vless allow-insecure is not supported", rule.ID)
+		}
+		if rule.TargetTransport == "xhttp" && rule.TargetXHTTPExtra != "" {
+			return fmt.Errorf("relay rule %q vless xhttp extra is not supported", rule.ID)
+		}
+		if rule.TargetTransport != "xhttp" {
+			if rule.TargetHost != "" {
+				return fmt.Errorf("relay rule %q vless tcp host is not supported", rule.ID)
+			}
+			if rule.TargetPath != "" {
+				return fmt.Errorf("relay rule %q vless tcp path is not supported", rule.ID)
+			}
+			if rule.TargetXHTTPMode != "" {
+				return fmt.Errorf("relay rule %q vless tcp xhttp mode is not supported", rule.ID)
+			}
+			if rule.TargetXHTTPExtra != "" {
+				return fmt.Errorf("relay rule %q vless tcp xhttp extra is not supported", rule.ID)
+			}
+		}
+	case "anytls":
+		if rule.TargetPassword == "" {
+			return fmt.Errorf("relay rule %q anytls password is required", rule.ID)
+		}
+		if rule.TargetAllowInsecure {
+			return fmt.Errorf("relay rule %q anytls allow-insecure is not supported", rule.ID)
+		}
 	case "trojan":
 		if rule.TargetPassword == "" {
 			return fmt.Errorf("relay rule %q trojan password is required", rule.ID)
@@ -525,6 +583,21 @@ func validateRelayRuntimeSupport(rule types.NodeRelayRule) error {
 		}
 		if rule.TargetAllowInsecure {
 			return fmt.Errorf("relay rule %q shadowsocks allow-insecure is not supported", rule.ID)
+		}
+		if rule.TargetSecurity != "" {
+			return fmt.Errorf("relay rule %q shadowsocks security is not supported", rule.ID)
+		}
+		if rule.TargetSNI != "" {
+			return fmt.Errorf("relay rule %q shadowsocks sni is not supported", rule.ID)
+		}
+		if rule.TargetTransport != "" && rule.TargetTransport != "tcp" {
+			return fmt.Errorf("relay rule %q shadowsocks transport is not supported", rule.ID)
+		}
+		if rule.TargetHost != "" {
+			return fmt.Errorf("relay rule %q shadowsocks host is not supported", rule.ID)
+		}
+		if rule.TargetPath != "" {
+			return fmt.Errorf("relay rule %q shadowsocks path is not supported", rule.ID)
 		}
 	}
 	return nil
@@ -709,6 +782,9 @@ func configRelayRules(values []config.NodeRelayRule) []types.NodeRelayRule {
 			TargetPath:          rule.TargetPath,
 			TargetXHTTPMode:     rule.TargetXHTTPMode,
 			TargetXHTTPExtra:    rule.TargetXHTTPExtra,
+			TargetFlow:          rule.TargetFlow,
+			TargetFingerprint:   rule.TargetFingerprint,
+			TargetALPN:          rule.TargetALPN,
 			TargetUUID:          rule.TargetUUID,
 			TargetPassword:      rule.TargetPassword,
 			TargetMethod:        rule.TargetMethod,

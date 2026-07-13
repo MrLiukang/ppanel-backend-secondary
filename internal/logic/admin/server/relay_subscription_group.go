@@ -2,10 +2,14 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +28,17 @@ import (
 
 var relaySubscriptionServerLocks sync.Map
 var errRelaySubscriptionRevisionMismatch = errors.New("relay subscription group revision mismatch")
+
+const relayPreviewTokenTTL = 5 * time.Minute
+
+type relayPreviewTokenBinding struct {
+	GroupID         int64  `json:"group_id"`
+	URL             string `json:"url"`
+	ListenPortStart int    `json:"listen_port_start"`
+	ListenPortStep  int    `json:"listen_port_step"`
+	Revision        string `json:"revision"`
+	RulesDigest     string `json:"rules_digest"`
+}
 
 type RelaySubscriptionGroupLogic struct {
 	logger.Logger
@@ -67,12 +82,15 @@ func (l *RelaySubscriptionGroupLogic) Save(req *types.RelaySubscriptionGroupRequ
 	if req.ListenPortStep <= 0 {
 		req.ListenPortStep = 100
 	}
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(req.URL)), "http") {
-		return xerr.NewErrCodeMsg(xerr.InvalidParams, "subscription url must use http or https")
+	if err := validateRelaySubscriptionRequest(req.AutoUpdate, req.URL); err != nil {
+		return xerr.NewErrCodeMsg(xerr.InvalidParams, err.Error())
 	}
 	clearCache := false
 	err := l.svcCtx.Store.InTx(l.ctx, func(store repository.Store) error {
 		db := store.DB().WithContext(l.ctx)
+		if err := lockRelaySubscriptionServerRow(db, req.ServerID); err != nil {
+			return err
+		}
 		if req.Id == 0 {
 			return db.Create(&node.RelaySubscriptionGroup{ServerId: req.ServerID, Name: req.Name, URL: req.URL, Enabled: req.Enabled, AutoUpdate: req.AutoUpdate, UpdateInterval: req.UpdateInterval, ListenPortStart: req.ListenPortStart, ListenPortStep: req.ListenPortStep, Rules: "[]", LastStatus: "never"}).Error
 		}
@@ -86,11 +104,16 @@ func (l *RelaySubscriptionGroupLogic) Save(req *types.RelaySubscriptionGroupRequ
 		if err := db.Save(&row).Error; err != nil {
 			return err
 		}
-		if wasEnabled && !row.Enabled {
+		deleteNodes, rebuild := relayGroupTransition(wasEnabled, row.Enabled)
+		if deleteNodes {
 			clearCache = true
 			if err := deleteRelayGroupNodesTx(db, req.ServerID, row.Id, nil); err != nil {
 				return err
 			}
+			return l.rebuildRelayRulesTx(db, req.ServerID)
+		}
+		if rebuild {
+			clearCache = true
 			return l.rebuildRelayRulesTx(db, req.ServerID)
 		}
 		return nil
@@ -101,11 +124,18 @@ func (l *RelaySubscriptionGroupLogic) Save(req *types.RelaySubscriptionGroupRequ
 	return l.clearServerNodeCache(req.ServerID)
 }
 
+func relayGroupTransition(wasEnabled, enabled bool) (deleteNodes, rebuild bool) {
+	return wasEnabled && !enabled, wasEnabled != enabled
+}
+
 func (l *RelaySubscriptionGroupLogic) Delete(id, serverID int64) error {
 	unlock := lockRelaySubscriptionServer(serverID)
 	defer unlock()
 	err := l.svcCtx.Store.InTx(l.ctx, func(store repository.Store) error {
 		db := store.DB().WithContext(l.ctx)
+		if err := lockRelaySubscriptionServerRow(db, serverID); err != nil {
+			return err
+		}
 		result := db.Where("id = ? AND server_id = ?", id, serverID).Delete(&node.RelaySubscriptionGroup{})
 		if result.Error != nil {
 			return result.Error
@@ -129,7 +159,19 @@ func (l *RelaySubscriptionGroupLogic) Preview(id, serverID int64) (*types.Subscr
 	if err := l.svcCtx.Store.DB().WithContext(l.ctx).Where("id = ? AND server_id = ?", id, serverID).First(&row).Error; err != nil {
 		return nil, err
 	}
-	return FetchSubscriptionRelayPreview(l.ctx, row.URL, SubscriptionRelayImportOptions{ListenPortStart: row.ListenPortStart, ListenPortStep: row.ListenPortStep})
+	resp, err := FetchSubscriptionRelayPreview(l.ctx, row.URL, SubscriptionRelayImportOptions{ListenPortStart: row.ListenPortStart, ListenPortStep: row.ListenPortStep})
+	if err != nil {
+		return nil, err
+	}
+	binding, err := relayPreviewBinding(row, resp.Rules)
+	if err != nil {
+		return nil, err
+	}
+	resp.PreviewToken, err = signRelayPreviewToken(l.svcCtx.Config.Node.NodeSecret, binding, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (l *RelaySubscriptionGroupLogic) Apply(req *types.RelaySubscriptionGroupApplyRequest, serverID int64) error {
@@ -137,9 +179,19 @@ func (l *RelaySubscriptionGroupLogic) Apply(req *types.RelaySubscriptionGroupApp
 	defer unlock()
 	err := l.svcCtx.Store.InTx(l.ctx, func(store repository.Store) error {
 		db := store.DB().WithContext(l.ctx)
+		if err := lockRelaySubscriptionServerRow(db, serverID); err != nil {
+			return err
+		}
 		var row node.RelaySubscriptionGroup
 		if err := db.Where("id = ? AND server_id = ?", req.Id, serverID).First(&row).Error; err != nil {
 			return err
+		}
+		binding, err := relayPreviewBinding(row, req.Rules)
+		if err != nil {
+			return err
+		}
+		if err := verifyRelayPreviewToken(l.svcCtx.Config.Node.NodeSecret, req.PreviewToken, binding, time.Now()); err != nil {
+			return xerr.NewErrCodeMsg(xerr.InvalidParams, err.Error())
 		}
 		if err := validateSubscriptionRuntimeRules(req.Rules); err != nil {
 			return xerr.NewErrCodeMsg(xerr.InvalidParams, err.Error())
@@ -213,6 +265,9 @@ func (l *RelaySubscriptionGroupLogic) SyncHealthyNodes(serverID int64, req *type
 	db := l.svcCtx.Store.DB().WithContext(l.ctx)
 	err = l.svcCtx.Store.InTx(l.ctx, func(store repository.Store) error {
 		tx := store.DB().WithContext(l.ctx)
+		if err := lockRelaySubscriptionServerRow(tx, serverID); err != nil {
+			return err
+		}
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND server_id = ?", req.GroupID, serverID).First(&row).Error; err != nil {
 			return err
 		}
@@ -234,7 +289,7 @@ func (l *RelaySubscriptionGroupLogic) SyncHealthyNodes(serverID int64, req *type
 			}
 			usedNames := make(map[string]struct{}, len(allNodes))
 			for _, item := range allNodes {
-				if !relayNodeBelongsToGroup(item.Tags, req.GroupID) {
+				if !relayNodeBelongsToGroup(item, req.GroupID) {
 					usedNames[item.Name] = struct{}{}
 				}
 			}
@@ -244,18 +299,13 @@ func (l *RelaySubscriptionGroupLogic) SyncHealthyNodes(serverID int64, req *type
 				}
 				result, reported := results[rule.ID]
 				if !reported || !rule.Enabled || !result.Healthy {
-					var existing node.Node
-					if err := findRelayGroupNode(tx, serverID, req.GroupID, rule.ID, &existing); err == nil {
-						existing.Enabled = boolPtr(false)
-						if err := tx.Save(&existing).Error; err != nil {
-							return err
-						}
+					if err := disableUnhealthyRelayNode(tx, serverID, req.GroupID, rule.ID); err != nil {
+						return err
 					}
 					continue
 				}
-				tags := "relay-group:" + fmt.Sprint(req.GroupID) + ",relay-rule:" + rule.ID
 				var existing node.Node
-				err := tx.Where("server_id = ? AND tags = ?", serverID, tags).First(&existing).Error
+				err := tx.Where("server_id = ? AND relay_group_id = ? AND relay_rule_id = ?", serverID, req.GroupID, rule.ID).First(&existing).Error
 				nameBase := strings.TrimSpace(rule.Remark)
 				if nameBase == "" {
 					nameBase = strings.TrimSpace(row.Name)
@@ -266,7 +316,7 @@ func (l *RelaySubscriptionGroupLogic) SyncHealthyNodes(serverID int64, req *type
 					if protocol == "" {
 						protocol = strings.ToLower(rule.TargetProtocol)
 					}
-					existing = node.Node{Name: name, Tags: tags, Port: uint16(rule.ListenPort), Address: server.Address, ServerId: serverID, Protocol: protocol, Enabled: boolPtr(true)}
+					existing = node.Node{Name: name, RelayGroupId: relayGroupIDPtr(req.GroupID), RelayRuleId: rule.ID, Port: uint16(rule.ListenPort), Address: server.Address, ServerId: serverID, Protocol: protocol, Enabled: boolPtr(true)}
 					if err := tx.Create(&existing).Error; err != nil {
 						return err
 					}
@@ -297,7 +347,9 @@ func (l *RelaySubscriptionGroupLogic) SyncHealthyNodes(serverID int64, req *type
 		if !shouldRecordRelayHealthFailure(err) {
 			return err
 		}
-		_ = db.Model(&row).Updates(applyStatusValues(err, time.Time{})).Error
+		if statusErr := db.Model(&row).Updates(applyStatusValues(err, time.Time{})).Error; statusErr != nil {
+			return errors.Wrapf(err, "record health failure: %v", statusErr)
+		}
 		return err
 	}
 	return l.clearServerNodeCache(serverID)
@@ -365,10 +417,10 @@ func deleteRelayGroupNodesTx(db *gorm.DB, serverID, groupID int64, currentRuleID
 	}
 	for _, item := range nodes {
 		if currentRuleIDs == nil {
-			if !relayNodeBelongsToGroup(item.Tags, groupID) {
+			if !relayNodeBelongsToGroup(item, groupID) {
 				continue
 			}
-		} else if !relayNodeIsOrphaned(item.Tags, groupID, currentRuleIDs) {
+		} else if !relayNodeIsOrphaned(item, groupID, currentRuleIDs) {
 			continue
 		}
 		if err := db.Delete(&item).Error; err != nil {
@@ -385,11 +437,17 @@ func lockRelaySubscriptionServer(serverID int64) func() {
 	return mu.Unlock
 }
 
-func (l *RelaySubscriptionGroupLogic) clearServerNodeCache(serverID int64) error {
-	return l.svcCtx.Store.Node().ClearNodeCache(l.ctx, &node.FilterNodeParams{Page: 1, Size: 1000, ServerId: []int64{serverID}})
+func lockRelaySubscriptionServerRow(db *gorm.DB, serverID int64) error {
+	var server node.Server
+	return db.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").Where("id = ?", serverID).First(&server).Error
 }
 
-func boolPtr(value bool) *bool { return &value }
+func (l *RelaySubscriptionGroupLogic) clearServerNodeCache(serverID int64) error {
+	return l.svcCtx.Store.Node().ClearServerCache(l.ctx, serverID)
+}
+
+func boolPtr(value bool) *bool           { return &value }
+func relayGroupIDPtr(value int64) *int64 { return &value }
 
 func validateRelayGroupHealthEnabled(enabled bool) error {
 	if !enabled {
@@ -405,29 +463,12 @@ func syncRelayNodeManagedFields(existing *node.Node, listenPort int, address, pr
 	existing.Enabled = boolPtr(true)
 }
 
-func relayNodeBelongsToGroup(tags string, groupID int64) bool {
-	needle := "relay-group:" + fmt.Sprint(groupID)
-	for _, tag := range strings.Split(tags, ",") {
-		if strings.TrimSpace(tag) == needle {
-			return true
-		}
-	}
-	return false
+func relayNodeBelongsToGroup(item node.Node, groupID int64) bool {
+	return item.RelayGroupId != nil && *item.RelayGroupId == groupID
 }
 
-func relayNodeMatchesGroupRule(tags string, groupID int64, ruleID string) bool {
-	groupTag := "relay-group:" + fmt.Sprint(groupID)
-	ruleTag := "relay-rule:" + ruleID
-	foundGroup, foundRule := false, false
-	for _, tag := range strings.Split(tags, ",") {
-		switch strings.TrimSpace(tag) {
-		case groupTag:
-			foundGroup = true
-		case ruleTag:
-			foundRule = true
-		}
-	}
-	return foundGroup && foundRule
+func relayNodeMatchesGroupRule(item node.Node, groupID int64, ruleID string) bool {
+	return relayNodeBelongsToGroup(item, groupID) && item.RelayRuleId == ruleID
 }
 
 func findRelayGroupNode(db *gorm.DB, serverID, groupID int64, ruleID string, result *node.Node) error {
@@ -436,7 +477,7 @@ func findRelayGroupNode(db *gorm.DB, serverID, groupID int64, ruleID string, res
 		return err
 	}
 	for _, item := range nodes {
-		if relayNodeMatchesGroupRule(item.Tags, groupID, ruleID) {
+		if relayNodeMatchesGroupRule(item, groupID, ruleID) {
 			*result = item
 			return nil
 		}
@@ -444,19 +485,36 @@ func findRelayGroupNode(db *gorm.DB, serverID, groupID int64, ruleID string, res
 	return gorm.ErrRecordNotFound
 }
 
-func relayNodeIsOrphaned(tags string, groupID int64, currentRuleIDs map[string]struct{}) bool {
-	if !relayNodeBelongsToGroup(tags, groupID) {
+func disableUnhealthyRelayNode(db *gorm.DB, serverID, groupID int64, ruleID string) error {
+	var existing node.Node
+	err := findRelayGroupNode(db, serverID, groupID, ruleID, &existing)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	existing.Enabled = boolPtr(false)
+	return db.Save(&existing).Error
+}
+
+func relayNodeIsOrphaned(item node.Node, groupID int64, currentRuleIDs map[string]struct{}) bool {
+	if !relayNodeBelongsToGroup(item, groupID) {
 		return false
 	}
-	for _, tag := range strings.Split(tags, ",") {
-		const prefix = "relay-rule:"
-		tag = strings.TrimSpace(tag)
-		if strings.HasPrefix(tag, prefix) {
-			_, current := currentRuleIDs[strings.TrimPrefix(tag, prefix)]
-			return !current
-		}
+	_, current := currentRuleIDs[item.RelayRuleId]
+	return !current
+}
+
+func validateRelaySubscriptionRequest(autoUpdate bool, rawURL string) error {
+	if autoUpdate {
+		return fmt.Errorf("auto_update is not supported")
 	}
-	return true
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("subscription url must use http or https")
+	}
+	return nil
 }
 
 func currentHealthResults(rules []types.NodeRelayRule, reported []types.RelaySubscriptionGroupHealthResult) (map[string]types.RelaySubscriptionGroupHealthResult, error) {
@@ -512,6 +570,9 @@ func sidecarRelayRules(rules []types.NodeRelayRule, groupID int64) []types.NodeR
 			mapped.TargetPath = ""
 			mapped.TargetXHTTPMode = ""
 			mapped.TargetXHTTPExtra = ""
+			mapped.TargetFlow = ""
+			mapped.TargetFingerprint = ""
+			mapped.TargetALPN = ""
 			mapped.TargetUUID = ""
 			mapped.TargetPassword = ""
 			mapped.TargetMethod = ""
@@ -565,6 +626,82 @@ func relaySubscriptionRulesRevision(rules []types.NodeRelayRule) (string, error)
 		return "", err
 	}
 	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
+}
+
+func relayPreviewBinding(row node.RelaySubscriptionGroup, previewRules []types.NodeRelayRule) (relayPreviewTokenBinding, error) {
+	var currentRules []types.NodeRelayRule
+	if err := json.Unmarshal([]byte(row.Rules), &currentRules); err != nil {
+		return relayPreviewTokenBinding{}, err
+	}
+	revision, err := relaySubscriptionRulesRevision(currentRules)
+	if err != nil {
+		return relayPreviewTokenBinding{}, err
+	}
+	rulesDigest, err := relaySubscriptionRulesRevision(previewRules)
+	if err != nil {
+		return relayPreviewTokenBinding{}, err
+	}
+	return relayPreviewTokenBinding{
+		GroupID:         row.Id,
+		URL:             row.URL,
+		ListenPortStart: row.ListenPortStart,
+		ListenPortStep:  row.ListenPortStep,
+		Revision:        revision,
+		RulesDigest:     rulesDigest,
+	}, nil
+}
+
+func signRelayPreviewToken(secret string, binding relayPreviewTokenBinding, issuedAt time.Time) (string, error) {
+	issued := strconv.FormatInt(issuedAt.Unix(), 10)
+	mac, err := relayPreviewTokenMAC(secret, binding, issued)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString([]byte(issued)) + "." + base64.RawURLEncoding.EncodeToString(mac), nil
+}
+
+func verifyRelayPreviewToken(secret, token string, binding relayPreviewTokenBinding, now time.Time) error {
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return errors.New("invalid preview token")
+	}
+	issuedBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return errors.New("invalid preview token")
+	}
+	issuedUnix, err := strconv.ParseInt(string(issuedBytes), 10, 64)
+	if err != nil {
+		return errors.New("invalid preview token")
+	}
+	issuedAt := time.Unix(issuedUnix, 0)
+	if issuedAt.After(now.Add(time.Minute)) || now.Sub(issuedAt) > relayPreviewTokenTTL {
+		return errors.New("preview token expired")
+	}
+	actualMAC, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return errors.New("invalid preview token")
+	}
+	expectedMAC, err := relayPreviewTokenMAC(secret, binding, string(issuedBytes))
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(actualMAC, expectedMAC) {
+		return errors.New("preview token does not match current subscription configuration")
+	}
+	return nil
+}
+
+func relayPreviewTokenMAC(secret string, binding relayPreviewTokenBinding, issued string) ([]byte, error) {
+	payload, err := json.Marshal(struct {
+		IssuedAt string `json:"issued_at"`
+		relayPreviewTokenBinding
+	}{IssuedAt: issued, relayPreviewTokenBinding: binding})
+	if err != nil {
+		return nil, err
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(payload)
+	return mac.Sum(nil), nil
 }
 
 func withCurrentRelayRevision(rules []types.NodeRelayRule, reported string, mutate func() error) error {
@@ -644,14 +781,7 @@ func validateSubscriptionRuntimeRules(rules []types.NodeRelayRule) error {
 			continue
 		}
 		switch rule.TargetProtocol {
-		case "anytls", "trojan", "shadowsocks":
-			if rule.TargetPassword == "" {
-				return fmt.Errorf("relay rule %q %s password is required", rule.ID, rule.TargetProtocol)
-			}
-		case "vless":
-			if rule.TargetUUID == "" {
-				return fmt.Errorf("relay rule %q vless uuid is required", rule.ID)
-			}
+		case "anytls", "vless", "trojan", "shadowsocks":
 		default:
 			return fmt.Errorf("relay rule %q protocol %q is not supported by subscription runtime", rule.ID, rule.TargetProtocol)
 		}

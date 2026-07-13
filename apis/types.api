@@ -243,6 +243,9 @@ type (
 		TargetPath      string `json:"target_path"`
 		TargetXHTTPMode string `json:"target_xhttp_mode"`
 		TargetXHTTPExtra string `json:"target_xhttp_extra"`
+		TargetFlow       string `json:"target_flow"`
+		TargetFingerprint string `json:"target_fingerprint"`
+		TargetALPN       string `json:"target_alpn"`
 		TargetUUID      string `json:"target_uuid"`
 		TargetPassword  string `json:"target_password"`
 	}

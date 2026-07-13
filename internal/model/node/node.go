@@ -8,18 +8,20 @@ import (
 )
 
 type Node struct {
-	Id        int64     `gorm:"primary_key"`
-	Name      string    `gorm:"type:varchar(100);not null;default:'';comment:Node Name"`
-	Tags      string    `gorm:"type:varchar(255);not null;default:'';comment:Tags"`
-	Port      uint16    `gorm:"not null;default:0;comment:Connect Port"`
-	Address   string    `gorm:"type:varchar(255);not null;default:'';comment:Connect Address"`
-	ServerId  int64     `gorm:"not null;default:0;comment:Server ID"`
-	Server    *Server   `gorm:"foreignKey:ServerId;references:Id"`
-	Protocol  string    `gorm:"type:varchar(100);not null;default:'';comment:Protocol"`
-	Enabled   *bool     `gorm:"type:boolean;not null;default:true;comment:Enabled"`
-	Sort      int       `gorm:"uniqueIndex;not null;default:0;comment:Sort"`
-	CreatedAt time.Time `gorm:"<-:create;comment:Creation Time"`
-	UpdatedAt time.Time `gorm:"comment:Update Time"`
+	Id           int64     `gorm:"primary_key"`
+	Name         string    `gorm:"type:varchar(100);not null;default:'';comment:Node Name"`
+	Tags         string    `gorm:"type:varchar(255);not null;default:'';comment:Tags"`
+	RelayGroupId *int64    `gorm:"index;comment:Owning relay subscription group"`
+	RelayRuleId  string    `gorm:"type:varchar(128);not null;default:'';index;comment:Owning relay rule"`
+	Port         uint16    `gorm:"not null;default:0;comment:Connect Port"`
+	Address      string    `gorm:"type:varchar(255);not null;default:'';comment:Connect Address"`
+	ServerId     int64     `gorm:"not null;default:0;comment:Server ID"`
+	Server       *Server   `gorm:"foreignKey:ServerId;references:Id"`
+	Protocol     string    `gorm:"type:varchar(100);not null;default:'';comment:Protocol"`
+	Enabled      *bool     `gorm:"type:boolean;not null;default:true;comment:Enabled"`
+	Sort         int       `gorm:"uniqueIndex;not null;default:0;comment:Sort"`
+	CreatedAt    time.Time `gorm:"<-:create;comment:Creation Time"`
+	UpdatedAt    time.Time `gorm:"comment:Update Time"`
 }
 
 func (n *Node) TableName() string {

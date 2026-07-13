@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -38,7 +38,11 @@ type relayRule struct {
 	TargetTransport     string `json:"target_transport"`
 	TargetPath          string `json:"target_path"`
 	TargetXHTTPMode     string `json:"target_xhttp_mode"`
+	TargetXHTTPExtra    string `json:"target_xhttp_extra"`
 	TargetUUID          string `json:"target_uuid"`
+	TargetFlow          string `json:"target_flow"`
+	TargetFingerprint   string `json:"target_fingerprint"`
+	TargetALPN          string `json:"target_alpn"`
 	TargetMethod        string `json:"target_method"`
 	TargetCipher        string `json:"target_cipher"`
 	TargetPlugin        string `json:"target_plugin"`
@@ -48,7 +52,7 @@ type relayRule struct {
 type group struct {
 	Id       int64       `json:"id"`
 	Enabled  bool        `json:"enabled"`
-	Revision int64       `json:"revision"`
+	Revision string      `json:"revision"`
 	Rules    []relayRule `json:"rules"`
 }
 
@@ -80,7 +84,7 @@ func main() {
 }
 
 func reconcile(client *http.Client, baseURL, serverID, secret, hostRoot, dockerRoot string) error {
-	request, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/v2/server/%s/relay-subscription-groups?secret_key=%s", baseURL, serverID, secret), nil)
+	request, err := newAuthenticatedRequest(http.MethodGet, fmt.Sprintf("%s/v2/server/%s/relay-subscription-groups", baseURL, serverID), serverID, secret, nil)
 	if err != nil {
 		return err
 	}
@@ -111,38 +115,32 @@ func reconcile(client *http.Client, baseURL, serverID, secret, hostRoot, dockerR
 	if err := os.MkdirAll(rulesDir, 0750); err != nil {
 		return err
 	}
-	if err := ensureSidecar(dockerRoot, dir); err != nil {
-		return err
-	}
-	entries, failures := buildRuntimeEntries(groups)
-	desired := make(map[string]runtimeEntry, len(entries))
-	for _, entry := range entries {
-		desired[entry.Key] = entry
-	}
 	statePath := filepath.Join(dir, "state.json")
-	state := map[string]string{}
-	if raw, err := os.ReadFile(statePath); err == nil {
-		_ = json.Unmarshal(raw, &state)
-	}
-	orphans, err := orphanRuleKeys(rulesDir, state)
+	state, err := readState(statePath)
 	if err != nil {
 		return err
 	}
-	for _, key := range orphans {
-		stopRule(key, dockerRoot, dir)
+	statePorts := make(map[string]int, len(state))
+	for key, item := range state {
+		statePorts[key] = item.Port
 	}
-	for key := range state {
-		if _, ok := desired[key]; !ok {
-			stopRule(key, dockerRoot, dir)
-			delete(state, key)
-		}
+	entries, failures := buildRuntimeEntriesWithPorts(groups, statePorts)
+	if err := ensureSidecar(dockerRoot, dir); err != nil {
+		return err
+	}
+	desired := desiredRuleKeys(payload.Groups)
+	if err := stopUndesired(state, desired, func(key string, port int) error {
+		return stopRule(key, dir, port)
+	}); err != nil {
+		return err
 	}
 	applyFailures := applyRuntimeEntries(entries, state,
 		func(entry runtimeEntry) bool { return ruleProcessAlive(entry.Key, dir) },
 		func(entry runtimeEntry) error {
-			return applyRuleUpdate(entry, rulesDir, validateRuleConfig,
-				func(key string) { stopRule(key, dockerRoot, dir) },
-				func(key string) error { return startRule(key, dir) })
+			return applyRuleUpdate(entry, state[entry.Key].Port, rulesDir, validateRuleConfig,
+				func(key string, port int) error { return stopRule(key, dir, port) },
+				startRule,
+				func(entry runtimeEntry) error { return verifyRuleStarted(entry, dir) })
 		})
 	for _, entry := range entries {
 		if err := applyFailures[entry.Key]; err != nil {
@@ -155,15 +153,76 @@ func reconcile(client *http.Client, baseURL, serverID, secret, hostRoot, dockerR
 	if err := writeStateAtomic(statePath, state); err != nil {
 		return err
 	}
+	return reportGroupsHealth(client, baseURL, serverID, secret, groups, failures, checkSOCKS)
+}
+
+func deriveServerToken(secret, serverID string) (string, error) {
+	id, err := strconv.ParseInt(serverID, 10, 64)
+	if err != nil || id <= 0 {
+		return "", fmt.Errorf("invalid server ID %q", serverID)
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = io.WriteString(mac, strconv.FormatInt(id, 10))
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+func newAuthenticatedRequest(method, rawURL, serverID, secret string, body io.Reader) (*http.Request, error) {
+	token, err := deriveServerToken(secret, serverID)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequest(method, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	query := request.URL.Query()
+	query.Set("secret_key", token)
+	request.URL.RawQuery = query.Encode()
+	return request, nil
+}
+
+func desiredRuleKeys(groups []group) map[string]struct{} {
+	desired := make(map[string]struct{})
 	for _, item := range groups {
-		if err := reportGroupHealthWithFailures(client, baseURL, serverID, secret, item, failures[item.Id], checkSOCKS); err != nil {
-			return err
+		if !item.Enabled {
+			continue
 		}
+		for _, rule := range item.Rules {
+			if rule.Enabled && strings.TrimSpace(rule.ID) != "" {
+				desired[runtimeKey(item.Id, rule.ID)] = struct{}{}
+			}
+		}
+	}
+	return desired
+}
+
+func stopUndesired(state map[string]runtimeState, desired map[string]struct{}, stop func(string, int) error) error {
+	for key, old := range state {
+		if _, ok := desired[key]; ok {
+			continue
+		}
+		if err := stop(key, old.Port); err != nil {
+			return fmt.Errorf("stop deleted or disabled rule %s: %w", key, err)
+		}
+		delete(state, key)
 	}
 	return nil
 }
 
-func applyRuleUpdate(entry runtimeEntry, rulesDir string, validate func(runtimeEntry, string, string) error, stop func(string), start func(string) error) error {
+func applyRuleUpdate(entry runtimeEntry, oldPort int, rulesDir string, validate func(runtimeEntry, string, string) error, stop func(string, int) error, start func(string) error, verify func(runtimeEntry) error) error {
+	return applyRuleUpdateWithFileOps(entry, oldPort, rulesDir, validate, stop, start, verify, defaultRuleUpdateFileOps())
+}
+
+type ruleUpdateFileOps struct {
+	remove func(string) error
+	rename func(string, string) error
+}
+
+func defaultRuleUpdateFileOps() ruleUpdateFileOps {
+	return ruleUpdateFileOps{remove: os.Remove, rename: os.Rename}
+}
+
+func applyRuleUpdateWithFileOps(entry runtimeEntry, oldPort int, rulesDir string, validate func(runtimeEntry, string, string) error, stop func(string, int) error, start func(string) error, verify func(runtimeEntry) error, fileOps ruleUpdateFileOps) error {
 	scriptPath := filepath.Join(rulesDir, entry.Key+".next.sh")
 	configPath := filepath.Join(rulesDir, entry.Key+".next.json")
 	defer os.Remove(scriptPath)
@@ -179,22 +238,83 @@ func applyRuleUpdate(entry runtimeEntry, rulesDir string, validate func(runtimeE
 	if err := validate(entry, scriptPath, configPath); err != nil {
 		return fmt.Errorf("validate rule %s: %w", entry.Key, err)
 	}
-	stop(entry.Key)
 	finalScript := filepath.Join(rulesDir, entry.Key+".sh")
 	finalConfig := filepath.Join(rulesDir, entry.Key+".json")
-	_ = os.Remove(finalScript)
-	if err := os.Rename(scriptPath, finalScript); err != nil {
-		return err
+	oldScript, scriptErr := os.ReadFile(finalScript)
+	oldConfig, configErr := os.ReadFile(finalConfig)
+	hadScript, hadConfig := scriptErr == nil, configErr == nil
+	if scriptErr != nil && !os.IsNotExist(scriptErr) {
+		return scriptErr
+	}
+	if configErr != nil && !os.IsNotExist(configErr) {
+		return configErr
+	}
+	if err := stop(entry.Key, oldPort); err != nil {
+		return fmt.Errorf("stop old rule %s: %w", entry.Key, err)
+	}
+	rollback := func(applyErr error, stopNew bool) error {
+		var rollbackErr error
+		if stopNew {
+			rollbackErr = stop(entry.Key, entry.Port)
+		}
+		if err := restoreRuleFile(finalScript, hadScript, oldScript, 0700); rollbackErr == nil && err != nil {
+			rollbackErr = err
+		}
+		if err := restoreRuleFile(finalConfig, hadConfig, oldConfig, 0600); rollbackErr == nil && err != nil {
+			rollbackErr = err
+		}
+		if rollbackErr == nil && hadScript {
+			rollbackErr = start(entry.Key)
+		}
+		if rollbackErr == nil && hadScript {
+			rollbackErr = verify(runtimeEntry{Key: entry.Key, Script: string(oldScript), Config: string(oldConfig), Port: oldPort})
+		}
+		if rollbackErr != nil {
+			return fmt.Errorf("apply rule %s: %v; rollback failed: %w", entry.Key, applyErr, rollbackErr)
+		}
+		return fmt.Errorf("apply rule %s: %w", entry.Key, applyErr)
+	}
+	if err := removeIfExists(finalScript, fileOps.remove); err != nil {
+		return rollback(fmt.Errorf("remove old script: %w", err), false)
+	}
+	if err := fileOps.rename(scriptPath, finalScript); err != nil {
+		return rollback(fmt.Errorf("rename script: %w", err), false)
 	}
 	if entry.Config != "" {
-		_ = os.Remove(finalConfig)
-		if err := os.Rename(configPath, finalConfig); err != nil {
-			return err
+		if err := removeIfExists(finalConfig, fileOps.remove); err != nil {
+			return rollback(fmt.Errorf("remove old config: %w", err), false)
+		}
+		if err := fileOps.rename(configPath, finalConfig); err != nil {
+			return rollback(fmt.Errorf("rename config: %w", err), false)
 		}
 	} else {
-		_ = os.Remove(finalConfig)
+		if err := removeIfExists(finalConfig, fileOps.remove); err != nil {
+			return rollback(fmt.Errorf("remove old config: %w", err), false)
+		}
 	}
-	return start(entry.Key)
+	applyErr := start(entry.Key)
+	if applyErr == nil {
+		applyErr = verify(entry)
+	}
+	if applyErr == nil {
+		return nil
+	}
+	return rollback(applyErr, true)
+}
+
+func removeIfExists(path string, remove func(string) error) error {
+	err := remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func restoreRuleFile(path string, existed bool, content []byte, mode os.FileMode) error {
+	if existed {
+		return os.WriteFile(path, content, mode)
+	}
+	return removeIfExists(path, os.Remove)
 }
 
 func validateRuleConfig(entry runtimeEntry, _, _ string) error {
@@ -208,7 +328,40 @@ func validateRuleConfig(entry runtimeEntry, _, _ string) error {
 	return docker("exec", sidecarName, "/usr/local/bin/xray", "run", "-test", "-c", "/config/rules/"+entry.Key+".next.json")
 }
 
-func writeStateAtomic(path string, state map[string]string) error {
+type runtimeState struct {
+	Digest string `json:"digest"`
+	Port   int    `json:"port"`
+}
+
+func readState(path string) (map[string]runtimeState, error) {
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return make(map[string]runtimeState), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, err
+	}
+	state := make(map[string]runtimeState, len(values))
+	for key, value := range values {
+		var item runtimeState
+		if err := json.Unmarshal(value, &item); err == nil && item.Digest != "" {
+			state[key] = item
+			continue
+		}
+		var legacyDigest string
+		if err := json.Unmarshal(value, &legacyDigest); err != nil {
+			return nil, fmt.Errorf("decode state for %s: %w", key, err)
+		}
+		state[key] = runtimeState{Digest: legacyDigest}
+	}
+	return state, nil
+}
+
+func writeStateAtomic(path string, state map[string]runtimeState) error {
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return err
@@ -245,22 +398,6 @@ func writeStateAtomic(path string, state map[string]string) error {
 	return os.Rename(tempPath, path)
 }
 
-func orphanRuleKeys(rulesDir string, state map[string]string) ([]string, error) {
-	matches, err := filepath.Glob(filepath.Join(rulesDir, "*.pid"))
-	if err != nil {
-		return nil, err
-	}
-	keys := make([]string, 0, len(matches))
-	for _, path := range matches {
-		key := strings.TrimSuffix(filepath.Base(path), ".pid")
-		if _, tracked := state[key]; !tracked {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
-	return keys, nil
-}
-
 type runtimeEntry struct {
 	Key, Digest, Script, Config string
 	Port                        int
@@ -281,6 +418,19 @@ func buildRuleRuntime(groupID int64, index int, rule relayRule) (runtimeEntry, b
 	}
 	if strings.TrimSpace(rule.ID) == "" {
 		return runtimeEntry{}, false, fmt.Errorf("relay rule ID is required")
+	}
+	for _, unsupported := range []struct {
+		field string
+		value string
+	}{
+		{field: "target_flow", value: rule.TargetFlow},
+		{field: "target_fingerprint", value: rule.TargetFingerprint},
+		{field: "target_alpn", value: rule.TargetALPN},
+		{field: "target_xhttp_extra", value: rule.TargetXHTTPExtra},
+	} {
+		if unsupported.value != "" {
+			return runtimeEntry{}, false, fmt.Errorf("rule %s: %s is unsupported by sidecar manager", rule.ID, unsupported.field)
+		}
 	}
 	if err := validateRuleCredentials(protocol, rule); err != nil {
 		return runtimeEntry{}, false, fmt.Errorf("rule %s: %w", rule.ID, err)
@@ -336,6 +486,38 @@ func buildRuntimeEntries(groups []group) ([]runtimeEntry, map[int64]map[string]e
 	return entries, failures
 }
 
+func buildRuntimeEntriesWithPorts(groups []group, statePorts map[string]int) ([]runtimeEntry, map[int64]map[string]error) {
+	used := make(map[int]struct{}, len(statePorts))
+	for _, port := range statePorts {
+		if port > 0 {
+			used[port] = struct{}{}
+		}
+	}
+	for groupIndex := range groups {
+		for ruleIndex := range groups[groupIndex].Rules {
+			rule := &groups[groupIndex].Rules[ruleIndex]
+			if rule.SidecarPort > 0 {
+				used[rule.SidecarPort] = struct{}{}
+				continue
+			}
+			if port := statePorts[runtimeKey(groups[groupIndex].Id, rule.ID)]; port > 0 {
+				rule.SidecarPort = port
+				continue
+			}
+			port := basePort(groups[groupIndex].Id) + ruleIndex
+			for {
+				if _, exists := used[port]; !exists {
+					break
+				}
+				port++
+			}
+			rule.SidecarPort = port
+			used[port] = struct{}{}
+		}
+	}
+	return buildRuntimeEntries(groups)
+}
+
 func validateRuleCredentials(protocol string, rule relayRule) error {
 	switch protocol {
 	case "anytls", "trojan":
@@ -379,38 +561,17 @@ func sidecarPort(groupID int64, index int, rule relayRule) int {
 	return basePort(groupID) + index
 }
 
-func validateRuntimePorts(groupID int64, entries []runtimeEntry) error {
-	const first, last = 31001, 61000
-	used := make(map[int]string, len(entries))
-	keys := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
-		if _, exists := keys[entry.Key]; exists {
-			return fmt.Errorf("duplicate runtime key %q", entry.Key)
-		}
-		keys[entry.Key] = struct{}{}
-		if entry.Port < first || entry.Port > last {
-			return fmt.Errorf("rule %s sidecar port %d is outside global range %d-%d", entry.Key, entry.Port, first, last)
-		}
-		if owner, exists := used[entry.Port]; exists {
-			return fmt.Errorf("rule %s sidecar port %d conflicts with %s", entry.Key, entry.Port, owner)
-		}
-		used[entry.Port] = entry.Key
-	}
-	return nil
-}
-
-func applyRuntimeEntries(entries []runtimeEntry, state map[string]string, alive func(runtimeEntry) bool, apply func(runtimeEntry) error) map[string]error {
+func applyRuntimeEntries(entries []runtimeEntry, state map[string]runtimeState, alive func(runtimeEntry) bool, apply func(runtimeEntry) error) map[string]error {
 	failures := make(map[string]error)
 	for _, entry := range entries {
-		if state[entry.Key] == entry.Digest && alive(entry) {
+		if state[entry.Key].Digest == entry.Digest && state[entry.Key].Port == entry.Port && alive(entry) {
 			continue
 		}
 		if err := apply(entry); err != nil {
 			failures[entry.Key] = err
-			delete(state, entry.Key)
 			continue
 		}
-		state[entry.Key] = entry.Digest
+		state[entry.Key] = runtimeState{Digest: entry.Digest, Port: entry.Port}
 	}
 	return failures
 }
@@ -454,19 +615,28 @@ func ruleProcessAlive(key, dir string) bool {
 	actual, err := inspectProcess(record.PID)
 	return err == nil && processIdentityMatches(record, actual)
 }
-func stopRule(key, dockerRoot, dir string) {
-	raw, _ := os.ReadFile(filepath.Join(dir, "rules", key+".pid"))
-	if record, err := parseProcessIdentity(string(raw)); err == nil {
-		_, _ = stopMatchingProcess(record, inspectProcess, func(pid string) error {
-			return docker("exec", sidecarName, "kill", pid)
-		})
-	}
-	_ = os.Remove(filepath.Join(dir, "rules", key+".pid"))
-	_ = os.Remove(filepath.Join(dir, "rules", key+".sh"))
-	_ = os.Remove(filepath.Join(dir, "rules", key+".json"))
+func stopRule(key, dir string, port int) error {
+	return stopTrackedRule(key, filepath.Join(dir, "rules"), port, inspectProcess, func(pid string) error {
+		return docker("exec", sidecarName, "kill", pid)
+	}, waitRuleStopped)
 }
-func startRule(key, dir string) error {
+func startRule(key string) error {
 	return docker("exec", "-d", sidecarName, "/bin/sh", "/config/rules/"+key+".sh")
+}
+
+func verifyRuleStarted(entry runtimeEntry, dir string) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if ruleProcessAlive(entry.Key, dir) {
+			connection, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", entry.Port), 100*time.Millisecond)
+			if err == nil {
+				_ = connection.Close()
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("rule %s did not start with matching PID and listening SOCKS port %d", entry.Key, entry.Port)
 }
 
 func parseProcessIdentity(value string) (processIdentity, error) {
@@ -518,8 +688,62 @@ func stopMatchingProcess(record processIdentity, inspect func(string) (processId
 	return true, nil
 }
 
-func reportGroupHealth(client *http.Client, baseURL, serverID, secret string, item group) error {
-	return reportGroupHealthWithProbe(client, baseURL, serverID, secret, item, checkSOCKS)
+func stopTrackedRule(key, rulesDir string, port int, inspect func(string) (processIdentity, error), kill func(string) error, wait func(processIdentity, int) error) error {
+	raw, err := os.ReadFile(filepath.Join(rulesDir, key+".pid"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err := wait(processIdentity{}, port); err != nil {
+				return err
+			}
+			return removeRuleFiles(key, rulesDir)
+		}
+		return err
+	}
+	record, err := parseProcessIdentity(string(raw))
+	if err != nil {
+		return err
+	}
+	_, err = stopMatchingProcess(record, inspect, kill)
+	if err != nil {
+		return err
+	}
+	if err := wait(record, port); err != nil {
+		return err
+	}
+	return removeRuleFiles(key, rulesDir)
+}
+
+func removeRuleFiles(key, rulesDir string) error {
+	for _, suffix := range []string{".pid", ".sh", ".json"} {
+		if err := os.Remove(filepath.Join(rulesDir, key+suffix)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func waitRuleStopped(record processIdentity, port int) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		processGone := record.PID == ""
+		if !processGone {
+			actual, err := inspectProcess(record.PID)
+			processGone = err != nil || !processIdentityMatches(record, actual)
+		}
+		portFree := port <= 0
+		if !portFree {
+			listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			if err == nil {
+				portFree = true
+				_ = listener.Close()
+			}
+		}
+		if processGone && portFree {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("process %s did not exit or port %d was not released", record.PID, port)
 }
 
 func reportGroupHealthWithProbe(client *http.Client, baseURL, serverID, secret string, item group, probe func(int) error) error {
@@ -553,7 +777,7 @@ func reportGroupHealthWithFailures(client *http.Client, baseURL, serverID, secre
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/v2/server/%s/relay-subscription-groups/health?secret_key=%s", baseURL, serverID, secret), strings.NewReader(string(body)))
+	request, err := newAuthenticatedRequest(http.MethodPost, fmt.Sprintf("%s/v2/server/%s/relay-subscription-groups/health", baseURL, serverID), serverID, secret, strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
@@ -566,6 +790,19 @@ func reportGroupHealthWithFailures(client *http.Client, baseURL, serverID, secre
 	if resp.StatusCode != http.StatusNoContent {
 		data, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("health report returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+	}
+	return nil
+}
+
+func reportGroupsHealth(client *http.Client, baseURL, serverID, secret string, groups []group, failures map[int64]map[string]error, probe func(int) error) error {
+	var messages []string
+	for _, item := range groups {
+		if err := reportGroupHealthWithFailures(client, baseURL, serverID, secret, item, failures[item.Id], probe); err != nil {
+			messages = append(messages, fmt.Sprintf("group %d: %v", item.Id, err))
+		}
+	}
+	if len(messages) > 0 {
+		return fmt.Errorf("health reports failed: %s", strings.Join(messages, "; "))
 	}
 	return nil
 }

@@ -10,6 +10,8 @@ import (
 	"github.com/perfect-panel/server/pkg/logger"
 	"github.com/perfect-panel/server/pkg/xerr"
 	"github.com/pkg/errors"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type UpdateServerNodeConfigLogic struct {
@@ -52,11 +54,15 @@ func (l *UpdateServerNodeConfigLogic) UpdateServerNodeConfig(req *types.UpdateSe
 		return errors.Wrapf(xerr.NewErrCodeMsg(xerr.InvalidParams, "relay rules are invalid"), "relay rules are invalid: %v", err)
 	}
 
-	if allInherited {
-		err = nodeStore.DeleteServerConfigOverride(l.ctx, req.ServerID)
-	} else {
-		err = nodeStore.SaveServerConfigOverride(l.ctx, data)
-	}
+	err = nodeStore.Transaction(l.ctx, func(db *gorm.DB) error {
+		if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").Where("id = ?", req.ServerID).First(&node.Server{}).Error; err != nil {
+			return err
+		}
+		if allInherited {
+			return nodeStore.DeleteServerConfigOverride(l.ctx, req.ServerID, db)
+		}
+		return nodeStore.SaveServerConfigOverride(l.ctx, data, db)
+	})
 	if err != nil {
 		l.Errorf("[UpdateServerNodeConfig] SaveServerConfigOverride Error: %v", err.Error())
 		return errors.Wrapf(xerr.NewErrCode(xerr.DatabaseUpdateError), "update server node config error: %v", err)

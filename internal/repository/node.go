@@ -52,6 +52,7 @@ type NodeRepo interface {
 	QueryServerAddresses(ctx context.Context) ([]string, error)
 	QueryEnabledNodeProtocols(ctx context.Context) ([]string, error)
 	ClearNodeCache(ctx context.Context, params *node.FilterNodeParams) error
+	ClearServerCache(ctx context.Context, serverId int64) error
 }
 
 var _ NodeRepo = (*nodeRepo)(nil)

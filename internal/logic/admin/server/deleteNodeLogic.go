@@ -34,6 +34,9 @@ func (l *DeleteNodeLogic) DeleteNode(req *types.DeleteNodeRequest) error {
 		l.Errorw("[DeleteNode] Query Database Error: ", logger.Field("error", err.Error()))
 		return errors.Wrapf(xerr.NewErrCode(xerr.DatabaseQueryError), "[DeleteNode] Query Database Error")
 	}
+	if err := rejectManagedRelayNode(data); err != nil {
+		return err
+	}
 
 	err = nodeStore.DeleteNode(l.ctx, req.Id)
 	if err != nil {
@@ -49,4 +52,11 @@ func (l *DeleteNodeLogic) DeleteNode(req *types.DeleteNodeRequest) error {
 		Search:   "",
 		Protocol: data.Protocol,
 	})
+}
+
+func rejectManagedRelayNode(data *node.Node) error {
+	if data.RelayGroupId != nil || data.RelayRuleId != "" {
+		return xerr.NewErrCodeMsg(xerr.InvalidParams, "managed relay nodes must be changed through their subscription group")
+	}
+	return nil
 }

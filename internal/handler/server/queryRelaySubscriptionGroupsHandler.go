@@ -14,13 +14,13 @@ import (
 
 func QueryRelaySubscriptionGroupsHandler(svcCtx *svc.ServiceContext) app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
-		if c.Query("secret_key") != svcCtx.Config.Node.NodeSecret {
-			c.String(consts.StatusUnauthorized, "Unauthorized")
-			return
-		}
 		serverID, err := strconv.ParseInt(c.Param("server_id"), 10, 64)
 		if err != nil {
 			c.String(consts.StatusBadRequest, "Invalid Params")
+			return
+		}
+		if !authorizeServerRequest(c, svcCtx, serverID) {
+			c.String(consts.StatusUnauthorized, "Unauthorized")
 			return
 		}
 		groups, err := adminserver.NewRelaySubscriptionGroupLogic(ctx, svcCtx).List(serverID)

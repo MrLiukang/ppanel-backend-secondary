@@ -10,11 +10,50 @@ import (
 
 	"github.com/perfect-panel/server/internal/model/node"
 	"github.com/perfect-panel/server/internal/types"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
 )
+
+func TestRelayNodeOwnershipDoesNotUseTags(t *testing.T) {
+	n := node.Node{Tags: "relay-group:7,relay-rule:user-tag", RelayGroupId: int64Ptr(9), RelayRuleId: "owned"}
+	if relayNodeBelongsToGroup(n, 7) {
+		t.Fatal("ordinary tags must not establish relay ownership")
+	}
+	if !relayNodeMatchesGroupRule(n, 9, "owned") {
+		t.Fatal("explicit ownership fields were not matched")
+	}
+}
+
+func TestValidateRelaySubscriptionRequestRejectsAutoUpdateAndInvalidURL(t *testing.T) {
+	if err := validateRelaySubscriptionRequest(true, "https://example.com/sub"); err == nil {
+		t.Fatal("auto_update=true accepted")
+	}
+	for _, raw := range []string{"httpx://example.com", "ftp://example.com", "https:example.com"} {
+		if err := validateRelaySubscriptionRequest(false, raw); err == nil {
+			t.Fatalf("invalid URL %q accepted", raw)
+		}
+	}
+	if err := validateRelaySubscriptionRequest(false, "https://example.com/sub"); err != nil {
+		t.Fatalf("valid URL rejected: %v", err)
+	}
+}
+
+func int64Ptr(value int64) *int64 { return &value }
 
 func TestValidateRelayGroupHealthEnabledRejectsDisabled(t *testing.T) {
 	if err := validateRelayGroupHealthEnabled(false); err == nil {
 		t.Fatal("disabled group accepted health results")
+	}
+}
+
+func TestRelayGroupTransitionRebuildsOnReenable(t *testing.T) {
+	deleteNodes, rebuild := relayGroupTransition(false, true)
+	if deleteNodes || !rebuild {
+		t.Fatalf("disable->enable transition = delete %v rebuild %v", deleteNodes, rebuild)
+	}
+	deleteNodes, rebuild = relayGroupTransition(true, false)
+	if !deleteNodes || !rebuild {
+		t.Fatalf("enable->disable transition = delete %v rebuild %v", deleteNodes, rebuild)
 	}
 }
 
@@ -51,13 +90,13 @@ func TestMergeSubscriptionRelayRulesPreservesManualRules(t *testing.T) {
 }
 
 func TestRelayNodeMatchesGroupRuleUsesExactTags(t *testing.T) {
-	if relayNodeMatchesGroupRule("relay-group:10,relay-rule:abc", 1, "abc") {
+	if relayNodeMatchesGroupRule(node.Node{RelayGroupId: int64Ptr(10), RelayRuleId: "abc"}, 1, "abc") {
 		t.Fatal("group 1 matched group 10 tags")
 	}
-	if relayNodeMatchesGroupRule("relay-group:1,relay-rule:abc-extra", 1, "abc") {
+	if relayNodeMatchesGroupRule(node.Node{RelayGroupId: int64Ptr(1), RelayRuleId: "abc-extra"}, 1, "abc") {
 		t.Fatal("rule abc matched rule abc-extra tag")
 	}
-	if !relayNodeMatchesGroupRule("relay-rule:abc, relay-group:1", 1, "abc") {
+	if !relayNodeMatchesGroupRule(node.Node{RelayGroupId: int64Ptr(1), RelayRuleId: "abc"}, 1, "abc") {
 		t.Fatal("exact group and rule tags did not match")
 	}
 }
@@ -76,13 +115,13 @@ func TestCurrentHealthResultsRejectUnknownRules(t *testing.T) {
 
 func TestRelayNodeIsOrphanedWhenRuleWasRemoved(t *testing.T) {
 	current := map[string]struct{}{"current": {}}
-	if !relayNodeIsOrphaned("relay-group:7,relay-rule:removed", 7, current) {
+	if !relayNodeIsOrphaned(node.Node{RelayGroupId: int64Ptr(7), RelayRuleId: "removed"}, 7, current) {
 		t.Fatal("removed derived node was not classified as orphaned")
 	}
-	if relayNodeIsOrphaned("relay-group:7,relay-rule:current", 7, current) {
+	if relayNodeIsOrphaned(node.Node{RelayGroupId: int64Ptr(7), RelayRuleId: "current"}, 7, current) {
 		t.Fatal("current derived node was classified as orphaned")
 	}
-	if relayNodeIsOrphaned("manual", 7, current) {
+	if relayNodeIsOrphaned(node.Node{Tags: "relay-group:7,relay-rule:removed"}, 7, current) {
 		t.Fatal("manual node was classified as orphaned")
 	}
 }
@@ -278,5 +317,20 @@ func TestApplyStatusValuesNeverReportsSuccessForFailure(t *testing.T) {
 	}
 	if values["last_status"] != "error" || values["last_error"] != "override rejected" {
 		t.Fatalf("failure values = %#v", values)
+	}
+}
+
+func TestDisableUnhealthyRelayNodePropagatesDatabaseError(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{
+		DSN:                       "gorm:gorm@tcp(localhost:9910)/gorm?charset=utf8&parseTime=True&loc=Local",
+		SkipInitializeWithVersion: true,
+	}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("node query failed")
+	db.AddError(want)
+	if err := disableUnhealthyRelayNode(db, 1, 2, "rule"); !errors.Is(err, want) {
+		t.Fatalf("disableUnhealthyRelayNode() error = %v, want %v", err, want)
 	}
 }
