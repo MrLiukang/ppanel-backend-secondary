@@ -125,13 +125,14 @@ type subscriptionYAMLProxy struct {
 	Port             yaml.Node `yaml:"port"`
 	Password         string    `yaml:"password"`
 	SNI              string    `yaml:"sni"`
+	ServerName       string    `yaml:"servername"`
 	SkipCertVerify   bool      `yaml:"skip-cert-verify"`
 	TargetTransport  string    `yaml:"network"`
 	TargetXHTTPMode  string    `yaml:"xhttp-mode"`
 	TargetXHTTPExtra string    `yaml:"xhttp-extra"`
 	Cipher           string    `yaml:"cipher"`
 	Plugin           string    `yaml:"plugin"`
-	PluginOpts       string    `yaml:"plugin-opts"`
+	PluginOpts       yaml.Node `yaml:"plugin-opts"`
 }
 
 func parseSubscriptionYAML(content string, options SubscriptionRelayImportOptions) ([]types.NodeRelayRule, []SubscriptionRelaySkipEntry, bool) {
@@ -149,6 +150,9 @@ func parseSubscriptionYAML(content string, options SubscriptionRelayImportOption
 	for _, proxy := range document.Proxies {
 		name := strings.TrimSpace(proxy.Name)
 		protocol := strings.ToLower(strings.TrimSpace(proxy.Type))
+		if protocol == "ss" {
+			protocol = "shadowsocks"
+		}
 		if protocol != "anytls" && protocol != "vless" && protocol != "trojan" && protocol != "shadowsocks" {
 			skipped = append(skipped, SubscriptionRelaySkipEntry{Name: name, Reason: fmt.Sprintf("unsupported protocol %q", protocol)})
 			continue
@@ -171,6 +175,10 @@ func parseSubscriptionYAML(content string, options SubscriptionRelayImportOption
 		if transport == "" {
 			transport = "tcp"
 		}
+		sni := strings.TrimSpace(proxy.SNI)
+		if sni == "" {
+			sni = strings.TrimSpace(proxy.ServerName)
+		}
 		rule := types.NodeRelayRule{
 			ID:                  relayImportID(name, start+len(rules)*step),
 			Enabled:             true,
@@ -182,7 +190,7 @@ func parseSubscriptionYAML(content string, options SubscriptionRelayImportOption
 			TargetPort:          port,
 			TargetProtocol:      protocol,
 			TargetSecurity:      security,
-			TargetSNI:           strings.TrimSpace(proxy.SNI),
+			TargetSNI:           sni,
 			TargetTransport:     transport,
 			TargetPassword:      strings.TrimSpace(proxy.Password),
 			TargetAllowInsecure: proxy.SkipCertVerify,
@@ -191,7 +199,16 @@ func parseSubscriptionYAML(content string, options SubscriptionRelayImportOption
 			TargetMethod:        strings.TrimSpace(proxy.Cipher),
 			TargetCipher:        strings.TrimSpace(proxy.Cipher),
 			TargetPlugin:        strings.TrimSpace(proxy.Plugin),
-			TargetPluginOpts:    strings.TrimSpace(proxy.PluginOpts),
+		}
+		if proxy.PluginOpts.Kind != 0 {
+			rule.TargetPluginOpts = strings.TrimSpace(proxy.PluginOpts.Value)
+			if rule.TargetPluginOpts == "" {
+				rule.TargetPluginOpts = "configured"
+			}
+		}
+		if reason := unsupportedImportedRelayRule(rule); reason != "" {
+			skipped = append(skipped, SubscriptionRelaySkipEntry{Name: name, Reason: reason})
+			continue
 		}
 		rules = append(rules, rule)
 	}
@@ -219,6 +236,12 @@ func decodeSubscriptionContent(raw string) string {
 		return string(decoded)
 	}
 	if decoded, err := base64.RawStdEncoding.DecodeString(raw); err == nil {
+		return string(decoded)
+	}
+	if decoded, err := base64.RawURLEncoding.DecodeString(raw); err == nil {
+		return string(decoded)
+	}
+	if decoded, err := base64.URLEncoding.DecodeString(raw); err == nil {
 		return string(decoded)
 	}
 	return raw
@@ -262,6 +285,17 @@ func parseSubscriptionRelayLine(line string, listenPort int, sort int) (types.No
 	query := u.Query()
 	credential := u.User.Username()
 	password, _ := u.User.Password()
+	if scheme == "shadowsocks" && password == "" {
+		if decoded, err := decodeBase64Value(credential); err == nil {
+			if method, secret, ok := strings.Cut(decoded, ":"); ok {
+				credential, password = method, secret
+			}
+		}
+	}
+	sni := strings.TrimSpace(query.Get("sni"))
+	if sni == "" {
+		sni = strings.TrimSpace(query.Get("servername"))
+	}
 	rule := types.NodeRelayRule{
 		ID:                  relayImportID(name, listenPort),
 		Enabled:             true,
@@ -273,7 +307,7 @@ func parseSubscriptionRelayLine(line string, listenPort int, sort int) (types.No
 		TargetPort:          port,
 		TargetProtocol:      scheme,
 		TargetSecurity:      strings.ToLower(strings.TrimSpace(query.Get("security"))),
-		TargetSNI:           strings.TrimSpace(query.Get("sni")),
+		TargetSNI:           sni,
 		TargetTransport:     strings.ToLower(strings.TrimSpace(query.Get("type"))),
 		TargetHost:          strings.TrimSpace(query.Get("host")),
 		TargetPath:          strings.TrimSpace(query.Get("path")),
@@ -303,6 +337,9 @@ func parseSubscriptionRelayLine(line string, listenPort int, sort int) (types.No
 			rule.TargetPassword = credential
 		}
 	}
+	if reason := unsupportedImportedRelayRule(rule); reason != "" {
+		return types.NodeRelayRule{}, name, reason
+	}
 	return rule, name, ""
 }
 
@@ -310,8 +347,57 @@ func decodeBase64Value(value string) (string, error) {
 	if decoded, err := base64.RawStdEncoding.DecodeString(value); err == nil {
 		return string(decoded), nil
 	}
-	decoded, err := base64.StdEncoding.DecodeString(value)
+	if decoded, err := base64.StdEncoding.DecodeString(value); err == nil {
+		return string(decoded), nil
+	}
+	if decoded, err := base64.RawURLEncoding.DecodeString(value); err == nil {
+		return string(decoded), nil
+	}
+	decoded, err := base64.URLEncoding.DecodeString(value)
 	return string(decoded), err
+}
+
+func unsupportedImportedRelayRule(rule types.NodeRelayRule) string {
+	switch rule.TargetProtocol {
+	case "trojan":
+		if rule.TargetPassword == "" {
+			return "trojan password is required"
+		}
+		if rule.TargetTransport != "" && rule.TargetTransport != "tcp" {
+			return fmt.Sprintf("trojan transport %q is not supported by relay runtime", rule.TargetTransport)
+		}
+		if rule.TargetSecurity != "" && rule.TargetSecurity != "tls" {
+			return fmt.Sprintf("trojan security %q is not supported by relay runtime", rule.TargetSecurity)
+		}
+		if rule.TargetAllowInsecure {
+			return "trojan allow-insecure is not supported by relay runtime"
+		}
+	case "shadowsocks":
+		if rule.TargetPassword == "" {
+			return "shadowsocks password is required"
+		}
+		if !validImportedShadowsocksCipher(rule.TargetMethod) {
+			return fmt.Sprintf("unsupported shadowsocks cipher %q", rule.TargetMethod)
+		}
+		if rule.TargetPlugin != "" || rule.TargetPluginOpts != "" {
+			return "shadowsocks plugin is not supported by relay runtime"
+		}
+		if rule.TargetAllowInsecure {
+			return "shadowsocks allow-insecure is not supported by relay runtime"
+		}
+	}
+	return ""
+}
+
+func validImportedShadowsocksCipher(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "xchacha20-poly1305",
+		"aes-128-cfb", "aes-256-cfb", "chacha20", "chacha20-ietf",
+		"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305":
+		return true
+	default:
+		return false
+	}
 }
 
 func displayName(u *url.URL) string {

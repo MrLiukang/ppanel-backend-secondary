@@ -98,6 +98,99 @@ func TestParseSubscriptionRelayRulesMapsTrojanAndShadowsocks(t *testing.T) {
 	}
 }
 
+func TestParseSubscriptionRelayRulesSupportsSIP002URLSafeBase64(t *testing.T) {
+	userinfo := base64.RawURLEncoding.EncodeToString([]byte("aes-256-gcm:p@ss"))
+	legacy := base64.RawURLEncoding.EncodeToString([]byte("chacha20-poly1305:secret@legacy.example.com:8388"))
+	raw := "ss://" + userinfo + "@sip002.example.com:443#SIP002\nss://" + legacy + "#Legacy"
+
+	rules, skipped := ParseSubscriptionRelayRules(raw, SubscriptionRelayImportOptions{})
+
+	require.Empty(t, skipped)
+	require.Len(t, rules, 2)
+	require.Equal(t, "aes-256-gcm", rules[0].TargetMethod)
+	require.Equal(t, "p@ss", rules[0].TargetPassword)
+	require.Equal(t, "sip002.example.com", rules[0].TargetAddress)
+	require.Equal(t, "chacha20-poly1305", rules[1].TargetMethod)
+	require.Equal(t, "legacy.example.com", rules[1].TargetAddress)
+}
+
+func TestParseSubscriptionRelayRulesMapsYAMLSSAndServername(t *testing.T) {
+	raw := `proxies:
+  - name: SS
+    type: ss
+    server: ss.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    servername: edge.example.com
+`
+
+	rules, skipped := ParseSubscriptionRelayRules(raw, SubscriptionRelayImportOptions{})
+
+	require.Empty(t, skipped)
+	require.Len(t, rules, 1)
+	require.Equal(t, "shadowsocks", rules[0].TargetProtocol)
+	require.Equal(t, "aes-128-gcm", rules[0].TargetMethod)
+	require.Equal(t, "edge.example.com", rules[0].TargetSNI)
+}
+
+func TestParseSubscriptionRelayRulesSkipsUnsupportedRuntimeCombinations(t *testing.T) {
+	raw := `proxies:
+  - name: SS plugin
+    type: ss
+    server: ss.example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: secret
+    plugin: v2ray-plugin
+    plugin-opts:
+      mode: websocket
+      host: cdn.example.com
+  - name: Trojan ws
+    type: trojan
+    server: trojan.example.com
+    port: 443
+    password: secret
+    network: ws
+  - name: Trojan insecure
+    type: trojan
+    server: trojan.example.com
+    port: 443
+    password: secret
+    skip-cert-verify: true
+`
+
+	rules, skipped := ParseSubscriptionRelayRules(raw, SubscriptionRelayImportOptions{})
+
+	require.Empty(t, rules)
+	require.Len(t, skipped, 3)
+	require.Contains(t, skipped[0].Reason, "plugin")
+	require.Contains(t, skipped[1].Reason, "transport")
+	require.Contains(t, skipped[2].Reason, "allow-insecure")
+}
+
+func TestParseSubscriptionRelayRulesRejectsMissingCredentialsAndInvalidCipher(t *testing.T) {
+	raw := "trojan://@trojan.example.com:443#NoPassword\n" +
+		"ss://" + base64.RawURLEncoding.EncodeToString([]byte("unknown-cipher:secret")) + "@ss.example.com:8388#BadCipher\n" +
+		"ss://" + base64.RawURLEncoding.EncodeToString([]byte("aes-256-gcm:")) + "@ss.example.com:8388#NoPassword"
+
+	rules, skipped := ParseSubscriptionRelayRules(raw, SubscriptionRelayImportOptions{})
+
+	require.Empty(t, rules)
+	require.Len(t, skipped, 3)
+	require.Contains(t, skipped[0].Reason, "password")
+	require.Contains(t, skipped[1].Reason, "cipher")
+	require.Contains(t, skipped[2].Reason, "password")
+}
+
+func TestParseSubscriptionRelayRulesMapsServernameQuery(t *testing.T) {
+	rules, skipped := ParseSubscriptionRelayRules("trojan://secret@example.com:443?security=tls&servername=edge.example.com#Trojan", SubscriptionRelayImportOptions{})
+
+	require.Empty(t, skipped)
+	require.Len(t, rules, 1)
+	require.Equal(t, "edge.example.com", rules[0].TargetSNI)
+}
+
 func TestFetchSubscriptionRelayPreviewReadsRemoteSubscription(t *testing.T) {
 	raw := base64.StdEncoding.EncodeToString([]byte("vless://11111111-1111-1111-1111-111111111111@hk1.example.com:443?type=xhttp&security=tls&sni=update.microsoft.com&path=%2Fpath&allowInsecure=1#HK%201"))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -131,8 +224,8 @@ func TestSidecarRelayRulesMapsAnyTLSToLocalSOCKS(t *testing.T) {
 		t.Fatalf("mapped VLESS rule = %#v", got[1])
 	}
 	groupTwo := sidecarRelayRules(rules, 2)
-	if groupTwo[0].TargetPort != 31101 || groupTwo[1].TargetPort != 31102 {
-		t.Fatalf("group port range = %#v", groupTwo)
+	if groupTwo[0].TargetPort != 31001 || groupTwo[1].TargetPort != 31002 {
+		t.Fatalf("server pool fallback = %#v", groupTwo)
 	}
 }
 

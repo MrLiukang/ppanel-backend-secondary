@@ -240,6 +240,7 @@ type NodeRelayRule struct {
 	Sort                int64  `json:"sort"`
 	Remark              string `json:"remark"`
 	ListenPort          int    `json:"listen_port"`
+	SidecarPort         int    `json:"sidecar_port,omitempty"`
 	Network             string `json:"network"`
 	TargetAddress       string `json:"target_address"`
 	TargetPort          int    `json:"target_port"`
@@ -253,6 +254,10 @@ type NodeRelayRule struct {
 	TargetXHTTPExtra    string `json:"target_xhttp_extra"`
 	TargetUUID          string `json:"target_uuid"`
 	TargetPassword      string `json:"target_password"`
+	TargetMethod        string `json:"target_method"`
+	TargetCipher        string `json:"target_cipher"`
+	TargetPlugin        string `json:"target_plugin"`
+	TargetPluginOpts    string `json:"target_plugin_opts"`
 	TargetAllowInsecure bool   `json:"target_allow_insecure"`
 }
 

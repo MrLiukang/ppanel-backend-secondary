@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,10 +22,12 @@ import (
 )
 
 const sidecarName = "ppanel-relay-sidecar"
+const alpineImage = "alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
 
 type relayRule struct {
 	ID                  string `json:"id"`
 	Enabled             bool   `json:"enabled"`
+	SidecarPort         int    `json:"sidecar_port"`
 	TargetProtocol      string `json:"target_protocol"`
 	TargetAddress       string `json:"target_address"`
 	TargetPort          int    `json:"target_port"`
@@ -42,9 +46,10 @@ type relayRule struct {
 }
 
 type group struct {
-	Id      int64       `json:"id"`
-	Enabled bool        `json:"enabled"`
-	Rules   []relayRule `json:"rules"`
+	Id       int64       `json:"id"`
+	Enabled  bool        `json:"enabled"`
+	Revision int64       `json:"revision"`
+	Rules    []relayRule `json:"rules"`
 }
 
 type response struct {
@@ -109,92 +114,305 @@ func reconcile(client *http.Client, baseURL, serverID, secret, hostRoot, dockerR
 	if err := ensureSidecar(dockerRoot, dir); err != nil {
 		return err
 	}
-	desired := make(map[string]runtimeEntry)
-	for _, item := range groups {
-		for index, rule := range item.Rules {
-			entry, ok, err := buildRuleRuntime(item.Id, index, rule)
-			if err != nil {
-				return err
-			}
-			if ok {
-				desired[entry.Key] = entry
-			}
-		}
+	entries, failures := buildRuntimeEntries(groups)
+	desired := make(map[string]runtimeEntry, len(entries))
+	for _, entry := range entries {
+		desired[entry.Key] = entry
 	}
 	statePath := filepath.Join(dir, "state.json")
 	state := map[string]string{}
 	if raw, err := os.ReadFile(statePath); err == nil {
 		_ = json.Unmarshal(raw, &state)
 	}
-	for key, digest := range state {
+	orphans, err := orphanRuleKeys(rulesDir, state)
+	if err != nil {
+		return err
+	}
+	for _, key := range orphans {
+		stopRule(key, dockerRoot, dir)
+	}
+	for key := range state {
 		if _, ok := desired[key]; !ok {
 			stopRule(key, dockerRoot, dir)
 			delete(state, key)
-			continue
-		}
-		if desired[key].Digest != digest || !ruleProcessAlive(key, dir) {
-			stopRule(key, dockerRoot, dir)
-			delete(state, key)
 		}
 	}
-	for key, entry := range desired {
-		if _, running := state[key]; running {
-			continue
+	applyFailures := applyRuntimeEntries(entries, state,
+		func(entry runtimeEntry) bool { return ruleProcessAlive(entry.Key, dir) },
+		func(entry runtimeEntry) error {
+			return applyRuleUpdate(entry, rulesDir, validateRuleConfig,
+				func(key string) { stopRule(key, dockerRoot, dir) },
+				func(key string) error { return startRule(key, dir) })
+		})
+	for _, entry := range entries {
+		if err := applyFailures[entry.Key]; err != nil {
+			if failures[entry.GroupID] == nil {
+				failures[entry.GroupID] = make(map[string]error)
+			}
+			failures[entry.GroupID][entry.RuleID] = err
 		}
-		if err := os.WriteFile(filepath.Join(rulesDir, key+".json"), []byte(entry.Config), 0600); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(rulesDir, key+".sh"), []byte(entry.Script), 0700); err != nil {
-			return err
-		}
-		if err := startRule(key, dir); err != nil {
-			return err
-		}
-		state[key] = entry.Digest
 	}
-	encoded, _ := json.Marshal(state)
-	if err := os.WriteFile(statePath, encoded, 0600); err != nil {
+	if err := writeStateAtomic(statePath, state); err != nil {
 		return err
 	}
 	for _, item := range groups {
-		if err := reportGroupHealth(client, baseURL, serverID, secret, item); err != nil {
+		if err := reportGroupHealthWithFailures(client, baseURL, serverID, secret, item, failures[item.Id], checkSOCKS); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-type runtimeEntry struct{ Key, Digest, Script, Config string }
+func applyRuleUpdate(entry runtimeEntry, rulesDir string, validate func(runtimeEntry, string, string) error, stop func(string), start func(string) error) error {
+	scriptPath := filepath.Join(rulesDir, entry.Key+".next.sh")
+	configPath := filepath.Join(rulesDir, entry.Key+".next.json")
+	defer os.Remove(scriptPath)
+	defer os.Remove(configPath)
+	if err := os.WriteFile(scriptPath, []byte(entry.Script), 0700); err != nil {
+		return err
+	}
+	if entry.Config != "" {
+		if err := os.WriteFile(configPath, []byte(entry.Config), 0600); err != nil {
+			return err
+		}
+	}
+	if err := validate(entry, scriptPath, configPath); err != nil {
+		return fmt.Errorf("validate rule %s: %w", entry.Key, err)
+	}
+	stop(entry.Key)
+	finalScript := filepath.Join(rulesDir, entry.Key+".sh")
+	finalConfig := filepath.Join(rulesDir, entry.Key+".json")
+	_ = os.Remove(finalScript)
+	if err := os.Rename(scriptPath, finalScript); err != nil {
+		return err
+	}
+	if entry.Config != "" {
+		_ = os.Remove(finalConfig)
+		if err := os.Rename(configPath, finalConfig); err != nil {
+			return err
+		}
+	} else {
+		_ = os.Remove(finalConfig)
+	}
+	return start(entry.Key)
+}
+
+func validateRuleConfig(entry runtimeEntry, _, _ string) error {
+	containerScript := "/config/rules/" + entry.Key + ".next.sh"
+	if err := docker("exec", sidecarName, "/bin/sh", "-n", containerScript); err != nil {
+		return err
+	}
+	if entry.Config == "" {
+		return nil
+	}
+	return docker("exec", sidecarName, "/usr/local/bin/xray", "run", "-test", "-c", "/config/rules/"+entry.Key+".next.json")
+}
+
+func writeStateAtomic(path string, state map[string]string) error {
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".state-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(encoded); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
+func orphanRuleKeys(rulesDir string, state map[string]string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(rulesDir, "*.pid"))
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(matches))
+	for _, path := range matches {
+		key := strings.TrimSuffix(filepath.Base(path), ".pid")
+		if _, tracked := state[key]; !tracked {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+type runtimeEntry struct {
+	Key, Digest, Script, Config string
+	Port                        int
+	GroupID                     int64
+	RuleID                      string
+}
+
+type processIdentity struct {
+	PID       string
+	StartTime string
+	Marker    string
+}
 
 func buildRuleRuntime(groupID int64, index int, rule relayRule) (runtimeEntry, bool, error) {
 	protocol := strings.ToLower(strings.TrimSpace(rule.TargetProtocol))
 	if !rule.Enabled || rule.TargetAddress == "" || rule.TargetPort <= 0 {
 		return runtimeEntry{}, false, nil
 	}
-	if protocol == "anytls" && rule.TargetPassword != "" {
-		key := runtimeKey(groupID, index, rule.ID)
-		script := fmt.Sprintf("#!/bin/sh\necho $$ > /config/rules/%s.pid\ntrap 'rm -f /config/rules/%s.pid' EXIT\nexec /usr/local/bin/anytls-client -l 127.0.0.1:%d -s %s:%d -p %s -sni %s\n", key, key, basePort(groupID)+index, shellQuote(rule.TargetAddress), rule.TargetPort, shellQuote(rule.TargetPassword), shellQuote(rule.TargetSNI))
-		return runtimeEntry{Key: key, Digest: digestOf(script), Script: script}, true, nil
+	if strings.TrimSpace(rule.ID) == "" {
+		return runtimeEntry{}, false, fmt.Errorf("relay rule ID is required")
 	}
-	if protocol != "vless" && protocol != "trojan" && protocol != "shadowsocks" {
-		return runtimeEntry{}, false, nil
+	if err := validateRuleCredentials(protocol, rule); err != nil {
+		return runtimeEntry{}, false, fmt.Errorf("rule %s: %w", rule.ID, err)
 	}
-	config, err := buildXrayConfig([]xrayRule{{Port: basePort(groupID) + index, Rule: rule}})
+	if protocol == "anytls" {
+		key, port := runtimeKey(groupID, rule.ID), sidecarPort(groupID, index, rule)
+		script := ruleScript(key, "anytls-client", fmt.Sprintf("exec /usr/local/bin/anytls-client -l 127.0.0.1:%d -s %s:%d -p %s -sni %s", port, shellQuote(rule.TargetAddress), rule.TargetPort, shellQuote(rule.TargetPassword), shellQuote(rule.TargetSNI)))
+		return runtimeEntry{Key: key, Digest: digestOf(script), Script: script, Port: port, GroupID: groupID, RuleID: rule.ID}, true, nil
+	}
+	port := sidecarPort(groupID, index, rule)
+	config, err := buildXrayConfig([]xrayRule{{Port: port, Rule: rule}})
 	if err != nil {
 		return runtimeEntry{}, false, err
 	}
-	key := runtimeKey(groupID, index, rule.ID)
-	script := fmt.Sprintf("#!/bin/sh\necho $$ > /config/rules/%s.pid\ntrap 'rm -f /config/rules/%s.pid' EXIT\nexec /usr/local/bin/xray run -c /config/rules/%s.json\n", key, key, key)
-	return runtimeEntry{Key: key, Digest: digestOf(config), Script: script, Config: config}, true, nil
+	key := runtimeKey(groupID, rule.ID)
+	marker := "/config/rules/" + key + ".json"
+	script := ruleScript(key, marker, "exec /usr/local/bin/xray run -c "+marker)
+	return runtimeEntry{Key: key, Digest: digestOf(config), Script: script, Config: config, Port: port, GroupID: groupID, RuleID: rule.ID}, true, nil
 }
 
-func runtimeKey(groupID int64, index int, ruleID string) string {
-	return fmt.Sprintf("g%d-r%d-%s", groupID, index, strings.Map(func(r rune) rune {
+func buildRuntimeEntries(groups []group) ([]runtimeEntry, map[int64]map[string]error) {
+	entries := make([]runtimeEntry, 0)
+	failures := make(map[int64]map[string]error)
+	usedPorts := make(map[int]string)
+	usedKeys := make(map[string]struct{})
+	for _, item := range groups {
+		for index, rule := range item.Rules {
+			entry, ok, err := buildRuleRuntime(item.Id, index, rule)
+			if err == nil && ok {
+				if _, exists := usedKeys[entry.Key]; exists {
+					err = fmt.Errorf("duplicate runtime key %q", entry.Key)
+				} else if entry.Port < 31001 || entry.Port > 61000 {
+					err = fmt.Errorf("rule %s sidecar port %d is outside global range 31001-61000", entry.Key, entry.Port)
+				} else if owner, exists := usedPorts[entry.Port]; exists {
+					err = fmt.Errorf("rule %s sidecar port %d conflicts with %s", entry.Key, entry.Port, owner)
+				}
+			}
+			if err != nil {
+				if failures[item.Id] == nil {
+					failures[item.Id] = make(map[string]error)
+				}
+				failures[item.Id][rule.ID] = err
+				continue
+			}
+			if !ok {
+				continue
+			}
+			usedKeys[entry.Key] = struct{}{}
+			usedPorts[entry.Port] = entry.Key
+			entries = append(entries, entry)
+		}
+	}
+	return entries, failures
+}
+
+func validateRuleCredentials(protocol string, rule relayRule) error {
+	switch protocol {
+	case "anytls", "trojan":
+		if rule.TargetPassword == "" {
+			return fmt.Errorf("%s password is required", protocol)
+		}
+	case "vless":
+		if rule.TargetUUID == "" {
+			return fmt.Errorf("vless UUID is required")
+		}
+	case "shadowsocks":
+		if rule.TargetPassword == "" {
+			return fmt.Errorf("shadowsocks password is required")
+		}
+		if rule.TargetMethod == "" && rule.TargetCipher == "" {
+			return fmt.Errorf("shadowsocks method is required")
+		}
+	default:
+		return fmt.Errorf("unsupported target protocol %q", protocol)
+	}
+	return nil
+}
+
+func ruleScript(key, marker, command string) string {
+	return fmt.Sprintf("#!/bin/sh\nstarttime=$(cut -d ' ' -f 22 /proc/$$/stat)\nprintf '%%s %%s %%s\\n' \"$$\" \"$starttime\" %s > /config/rules/%s.pid\ntrap 'rm -f /config/rules/%s.pid' EXIT\n%s\n", shellQuote(marker), key, key, command)
+}
+
+func runtimeKey(groupID int64, ruleID string) string {
+	return fmt.Sprintf("g%d-%s", groupID, strings.Map(func(r rune) rune {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
 			return r
 		}
 		return '-'
 	}, ruleID))
+}
+
+func sidecarPort(groupID int64, index int, rule relayRule) int {
+	if rule.SidecarPort > 0 {
+		return rule.SidecarPort
+	}
+	return basePort(groupID) + index
+}
+
+func validateRuntimePorts(groupID int64, entries []runtimeEntry) error {
+	const first, last = 31001, 61000
+	used := make(map[int]string, len(entries))
+	keys := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if _, exists := keys[entry.Key]; exists {
+			return fmt.Errorf("duplicate runtime key %q", entry.Key)
+		}
+		keys[entry.Key] = struct{}{}
+		if entry.Port < first || entry.Port > last {
+			return fmt.Errorf("rule %s sidecar port %d is outside global range %d-%d", entry.Key, entry.Port, first, last)
+		}
+		if owner, exists := used[entry.Port]; exists {
+			return fmt.Errorf("rule %s sidecar port %d conflicts with %s", entry.Key, entry.Port, owner)
+		}
+		used[entry.Port] = entry.Key
+	}
+	return nil
+}
+
+func applyRuntimeEntries(entries []runtimeEntry, state map[string]string, alive func(runtimeEntry) bool, apply func(runtimeEntry) error) map[string]error {
+	failures := make(map[string]error)
+	for _, entry := range entries {
+		if state[entry.Key] == entry.Digest && alive(entry) {
+			continue
+		}
+		if err := apply(entry); err != nil {
+			failures[entry.Key] = err
+			delete(state, entry.Key)
+			continue
+		}
+		state[entry.Key] = entry.Digest
+	}
+	return failures
 }
 func digestOf(value string) string {
 	sum := sha256.Sum256([]byte(value))
@@ -214,7 +432,7 @@ func ensureSidecar(dockerRoot, dir string) error {
 			return err
 		}
 	}
-	return docker("run", "-d", "--name", sidecarName, "--network", "host", "--restart", "unless-stopped", "--label", "ppanel.relay.mode=per-rule", "-v", dockerRoot+"/relay-sidecar:/config", "-v", dockerRoot+"/anytls-client:/usr/local/bin/anytls-client:ro", "-v", dockerRoot+"/relay-sidecar/xray:/usr/local/bin/xray:ro", "alpine:3.20", "/bin/sh", "-c", "while :; do sleep 3600; done")
+	return docker("run", "-d", "--name", sidecarName, "--network", "host", "--restart", "unless-stopped", "--label", "ppanel.relay.mode=per-rule", "-v", dockerRoot+"/relay-sidecar:/config", "-v", dockerRoot+"/anytls-client:/usr/local/bin/anytls-client:ro", "-v", dockerRoot+"/relay-sidecar/xray:/usr/local/bin/xray:ro", alpineImage, "/bin/sh", "-c", "while :; do sleep 3600; done")
 }
 
 func containerMode() string {
@@ -229,14 +447,19 @@ func ruleProcessAlive(key, dir string) bool {
 	if err != nil {
 		return false
 	}
-	pid := strings.TrimSpace(string(raw))
-	return exec.Command("docker", "exec", sidecarName, "kill", "-0", pid).Run() == nil
+	record, err := parseProcessIdentity(string(raw))
+	if err != nil {
+		return false
+	}
+	actual, err := inspectProcess(record.PID)
+	return err == nil && processIdentityMatches(record, actual)
 }
 func stopRule(key, dockerRoot, dir string) {
 	raw, _ := os.ReadFile(filepath.Join(dir, "rules", key+".pid"))
-	pid := strings.TrimSpace(string(raw))
-	if pid != "" {
-		_ = docker("exec", sidecarName, "kill", pid)
+	if record, err := parseProcessIdentity(string(raw)); err == nil {
+		_, _ = stopMatchingProcess(record, inspectProcess, func(pid string) error {
+			return docker("exec", sidecarName, "kill", pid)
+		})
 	}
 	_ = os.Remove(filepath.Join(dir, "rules", key+".pid"))
 	_ = os.Remove(filepath.Join(dir, "rules", key+".sh"))
@@ -246,27 +469,87 @@ func startRule(key, dir string) error {
 	return docker("exec", "-d", sidecarName, "/bin/sh", "/config/rules/"+key+".sh")
 }
 
+func parseProcessIdentity(value string) (processIdentity, error) {
+	fields := strings.Fields(value)
+	if len(fields) != 3 {
+		return processIdentity{}, fmt.Errorf("invalid process identity")
+	}
+	if _, err := strconv.Atoi(fields[0]); err != nil {
+		return processIdentity{}, fmt.Errorf("invalid process PID: %w", err)
+	}
+	return processIdentity{PID: fields[0], StartTime: fields[1], Marker: fields[2]}, nil
+}
+
+func inspectProcess(pid string) (processIdentity, error) {
+	stat, err := exec.Command("docker", "exec", sidecarName, "cat", "/proc/"+pid+"/stat").Output()
+	if err != nil {
+		return processIdentity{}, err
+	}
+	closing := strings.LastIndex(string(stat), ")")
+	if closing < 0 {
+		return processIdentity{}, fmt.Errorf("invalid /proc/%s/stat", pid)
+	}
+	fields := strings.Fields(string(stat)[closing+1:])
+	if len(fields) < 20 {
+		return processIdentity{}, fmt.Errorf("short /proc/%s/stat", pid)
+	}
+	cmdline, err := exec.Command("docker", "exec", sidecarName, "cat", "/proc/"+pid+"/cmdline").Output()
+	if err != nil {
+		return processIdentity{}, err
+	}
+	return processIdentity{PID: pid, StartTime: fields[19], Marker: string(cmdline)}, nil
+}
+
+func processIdentityMatches(record, actual processIdentity) bool {
+	return record.PID == actual.PID && record.StartTime != "" && record.StartTime == actual.StartTime && record.Marker != "" && strings.Contains(actual.Marker, record.Marker)
+}
+
+func stopMatchingProcess(record processIdentity, inspect func(string) (processIdentity, error), kill func(string) error) (bool, error) {
+	actual, err := inspect(record.PID)
+	if err != nil {
+		return false, nil
+	}
+	if !processIdentityMatches(record, actual) {
+		return false, nil
+	}
+	if err := kill(record.PID); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 func reportGroupHealth(client *http.Client, baseURL, serverID, secret string, item group) error {
+	return reportGroupHealthWithProbe(client, baseURL, serverID, secret, item, checkSOCKS)
+}
+
+func reportGroupHealthWithProbe(client *http.Client, baseURL, serverID, secret string, item group, probe func(int) error) error {
+	return reportGroupHealthWithFailures(client, baseURL, serverID, secret, item, nil, probe)
+}
+
+func reportGroupHealthWithFailures(client *http.Client, baseURL, serverID, secret string, item group, failures map[string]error, probe func(int) error) error {
 	results := make([]map[string]any, 0, len(item.Rules))
-	port := basePort(item.Id)
-	for _, rule := range item.Rules {
+	for index, rule := range item.Rules {
 		result := map[string]any{"rule_id": rule.ID, "healthy": false}
+		if ruleErr := failures[rule.ID]; ruleErr != nil {
+			result["error"] = ruleErr.Error()
+			results = append(results, result)
+			continue
+		}
 		protocol := strings.ToLower(strings.TrimSpace(rule.TargetProtocol))
 		valid := rule.Enabled && rule.TargetAddress != "" && rule.TargetPort > 0 && ((protocol == "anytls" && rule.TargetPassword != "") || (protocol == "vless" && rule.TargetUUID != "") || (protocol == "trojan" && rule.TargetPassword != "") || (protocol == "shadowsocks" && rule.TargetPassword != "" && (rule.TargetMethod != "" || rule.TargetCipher != "")))
 		if valid {
-			if err := checkSOCKS(port); err == nil {
+			if err := probe(sidecarPort(item.Id, index, rule)); err == nil {
 				result["healthy"] = true
 			} else {
 				result["error"] = err.Error()
 			}
-			port++
 		}
 		results = append(results, result)
 		if !valid {
 			continue
 		}
 	}
-	body, err := json.Marshal(map[string]any{"group_id": item.Id, "results": results})
+	body, err := json.Marshal(map[string]any{"group_id": item.Id, "revision": item.Revision, "results": results})
 	if err != nil {
 		return err
 	}
@@ -307,49 +590,6 @@ func checkSOCKS(port int) error {
 		return fmt.Errorf("probe returned %s", resp.Status)
 	}
 	return nil
-}
-
-func buildRuntime(groups []group) (string, string, error) {
-	var script strings.Builder
-	script.WriteString("#!/bin/sh\nset -eu\npids=\"\"\ncleanup() { for pid in $pids; do kill \"$pid\" 2>/dev/null || true; done; }\ntrap cleanup TERM INT EXIT\n")
-	var xrayRules []xrayRule
-	for _, item := range groups {
-		port := basePort(item.Id)
-		for _, rule := range item.Rules {
-			if !rule.Enabled || rule.TargetAddress == "" || rule.TargetPort <= 0 {
-				continue
-			}
-			switch strings.ToLower(strings.TrimSpace(rule.TargetProtocol)) {
-			case "anytls":
-				if rule.TargetPassword == "" {
-					continue
-				}
-				script.WriteString(fmt.Sprintf("/usr/local/bin/anytls-client -l 127.0.0.1:%d -s %s:%d -p %s -sni %s >/tmp/anytls-%d.log 2>&1 &\npids=\"$pids $!\"\n", port, shellQuote(rule.TargetAddress), rule.TargetPort, shellQuote(rule.TargetPassword), shellQuote(rule.TargetSNI), port))
-			case "vless":
-				if rule.TargetUUID == "" {
-					continue
-				}
-				xrayRules = append(xrayRules, xrayRule{Port: port, Rule: rule})
-			case "trojan":
-				if rule.TargetPassword == "" {
-					continue
-				}
-				xrayRules = append(xrayRules, xrayRule{Port: port, Rule: rule})
-			case "shadowsocks":
-				if rule.TargetPassword == "" || (rule.TargetMethod == "" && rule.TargetCipher == "") {
-					continue
-				}
-				xrayRules = append(xrayRules, xrayRule{Port: port, Rule: rule})
-			}
-			port++
-		}
-	}
-	if len(xrayRules) > 0 {
-		script.WriteString("/usr/local/bin/xray run -c /config/xray.json >/tmp/xray.log 2>&1 &\npids=\"$pids $!\"\n")
-	}
-	script.WriteString("while :; do sleep 30; done\n")
-	config, err := buildXrayConfig(xrayRules)
-	return script.String(), config, err
 }
 
 type xrayRule struct {

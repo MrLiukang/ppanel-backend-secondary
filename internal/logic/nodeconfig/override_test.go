@@ -1,6 +1,7 @@
 package nodeconfig
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/perfect-panel/server/internal/config"
@@ -273,6 +274,78 @@ func TestNormalizeRelayRules(t *testing.T) {
 	}
 	if got.TargetUUID != "11111111-1111-1111-1111-111111111111" {
 		t.Fatalf("target uuid = %q", got.TargetUUID)
+	}
+}
+
+func TestNormalizeRelayRulesPreservesShadowsocksFields(t *testing.T) {
+	rules := NormalizeRelayRules([]types.NodeRelayRule{{
+		ID: "ss", Enabled: true, ListenPort: 643, Network: "tcp,udp",
+		TargetAddress: "ss.example.com", TargetPort: 8388, TargetProtocol: "shadowsocks",
+		TargetMethod: " aes-256-gcm ", TargetCipher: " aes-256-gcm ",
+		TargetPassword: " secret ", TargetPlugin: " ", TargetPluginOpts: " ",
+	}})
+
+	if len(rules) != 1 {
+		t.Fatalf("len = %d, want 1", len(rules))
+	}
+	if rules[0].TargetMethod != "aes-256-gcm" || rules[0].TargetCipher != "aes-256-gcm" || rules[0].TargetPassword != "secret" {
+		t.Fatalf("normalized shadowsocks rule = %#v", rules[0])
+	}
+}
+
+func TestGlobalValuesPreservesRelaySidecarAndShadowsocksFields(t *testing.T) {
+	values := GlobalValues(config.NodeConfig{RelayRules: []config.NodeRelayRule{{
+		ID: "ss", Enabled: true, ListenPort: 643, SidecarPort: 31001, Network: "tcp,udp",
+		TargetAddress: "ss.example.com", TargetPort: 8388, TargetProtocol: "shadowsocks",
+		TargetMethod: "aes-256-gcm", TargetCipher: "aes-256-gcm", TargetPassword: "secret",
+		TargetPlugin: "v2ray-plugin", TargetPluginOpts: "mode=websocket",
+	}}})
+
+	if len(values.RelayRules) != 1 {
+		t.Fatalf("len = %d, want 1", len(values.RelayRules))
+	}
+	got := values.RelayRules[0]
+	if got.SidecarPort != 31001 || got.TargetMethod != "aes-256-gcm" || got.TargetCipher != "aes-256-gcm" || got.TargetPlugin != "v2ray-plugin" || got.TargetPluginOpts != "mode=websocket" {
+		t.Fatalf("config relay rule lost runtime fields: %#v", got)
+	}
+}
+
+func TestValidateRelayRulesRejectsUnsupportedRuntimeCombinations(t *testing.T) {
+	tests := []struct {
+		name string
+		rule types.NodeRelayRule
+		want string
+	}{
+		{name: "trojan password", rule: types.NodeRelayRule{TargetProtocol: "trojan", TargetTransport: "tcp"}, want: "password"},
+		{name: "trojan transport", rule: types.NodeRelayRule{TargetProtocol: "trojan", TargetTransport: "ws", TargetPassword: "secret"}, want: "transport"},
+		{name: "trojan insecure", rule: types.NodeRelayRule{TargetProtocol: "trojan", TargetTransport: "tcp", TargetPassword: "secret", TargetAllowInsecure: true}, want: "allow-insecure"},
+		{name: "ss password", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetMethod: "aes-256-gcm"}, want: "password"},
+		{name: "ss cipher", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "invalid"}, want: "cipher"},
+		{name: "ss plugin", rule: types.NodeRelayRule{TargetProtocol: "shadowsocks", TargetPassword: "secret", TargetMethod: "aes-256-gcm", TargetPlugin: "obfs-local"}, want: "plugin"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.rule.ID = "rule"
+			tt.rule.Enabled = true
+			tt.rule.ListenPort = 643
+			tt.rule.Network = "tcp,udp"
+			tt.rule.TargetAddress = "example.com"
+			tt.rule.TargetPort = 443
+			err := ValidateRelayRules([]types.NodeRelayRule{tt.rule})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ValidateRelayRules() error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateRelayRulesAcceptsBasicTrojanAndShadowsocks(t *testing.T) {
+	err := ValidateRelayRules([]types.NodeRelayRule{
+		{ID: "trojan", Enabled: true, ListenPort: 643, Network: "tcp,udp", TargetAddress: "trojan.example.com", TargetPort: 443, TargetProtocol: "trojan", TargetSecurity: "tls", TargetTransport: "tcp", TargetPassword: "secret"},
+		{ID: "ss", Enabled: true, ListenPort: 743, Network: "tcp,udp", TargetAddress: "ss.example.com", TargetPort: 8388, TargetProtocol: "shadowsocks", TargetMethod: "aes-256-gcm", TargetPassword: "secret"},
+	})
+	if err != nil {
+		t.Fatalf("ValidateRelayRules() error = %v", err)
 	}
 }
 

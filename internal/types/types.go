@@ -1334,6 +1334,7 @@ type NodeRelayRule struct {
 	Sort                int64  `json:"sort"`
 	Remark              string `json:"remark"`
 	ListenPort          int    `json:"listen_port"`
+	SidecarPort         int    `json:"sidecar_port,omitempty"`
 	Network             string `json:"network"`
 	TargetAddress       string `json:"target_address"`
 	TargetPort          int    `json:"target_port"`
@@ -1826,6 +1827,7 @@ type SubscriptionRelayPreviewResponse struct {
 
 type RelaySubscriptionGroup struct {
 	Id              int64           `json:"id"`
+	Revision        string          `json:"revision"`
 	ServerID        int64           `json:"server_id"`
 	Name            string          `json:"name"`
 	URL             string          `json:"url"`
@@ -1870,8 +1872,9 @@ type RelaySubscriptionGroupHealthResult struct {
 }
 
 type RelaySubscriptionGroupHealthRequest struct {
-	GroupID int64                                `json:"group_id"`
-	Results []RelaySubscriptionGroupHealthResult `json:"results"`
+	GroupID  int64                                `json:"group_id"`
+	Revision string                               `json:"revision" validate:"required"`
+	Results  []RelaySubscriptionGroupHealthResult `json:"results"`
 }
 
 type RelaySubscriptionGroupApplyRequest struct {

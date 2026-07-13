@@ -431,6 +431,7 @@ func NormalizeRelayRules(values []types.NodeRelayRule) []types.NodeRelayRule {
 			Sort:                item.Sort,
 			Remark:              strings.TrimSpace(item.Remark),
 			ListenPort:          item.ListenPort,
+			SidecarPort:         item.SidecarPort,
 			Network:             strings.TrimSpace(item.Network),
 			TargetAddress:       strings.TrimSpace(item.TargetAddress),
 			TargetPort:          item.TargetPort,
@@ -444,6 +445,10 @@ func NormalizeRelayRules(values []types.NodeRelayRule) []types.NodeRelayRule {
 			TargetXHTTPExtra:    strings.TrimSpace(item.TargetXHTTPExtra),
 			TargetUUID:          strings.TrimSpace(item.TargetUUID),
 			TargetPassword:      strings.TrimSpace(item.TargetPassword),
+			TargetMethod:        strings.TrimSpace(item.TargetMethod),
+			TargetCipher:        strings.TrimSpace(item.TargetCipher),
+			TargetPlugin:        strings.TrimSpace(item.TargetPlugin),
+			TargetPluginOpts:    strings.TrimSpace(item.TargetPluginOpts),
 			TargetAllowInsecure: item.TargetAllowInsecure,
 		}
 		if isEmptyRelayRule(rule) {
@@ -482,8 +487,58 @@ func ValidateRelayRules(rules []types.NodeRelayRule) error {
 		if !validRoutingNetwork(rule.Network) {
 			return fmt.Errorf("relay rule %q has invalid network %q", rule.ID, rule.Network)
 		}
+		if err := validateRelayRuntimeSupport(rule); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func validateRelayRuntimeSupport(rule types.NodeRelayRule) error {
+	switch rule.TargetProtocol {
+	case "trojan":
+		if rule.TargetPassword == "" {
+			return fmt.Errorf("relay rule %q trojan password is required", rule.ID)
+		}
+		if rule.TargetTransport != "" && rule.TargetTransport != "tcp" {
+			return fmt.Errorf("relay rule %q trojan transport %q is not supported", rule.ID, rule.TargetTransport)
+		}
+		if rule.TargetSecurity != "" && rule.TargetSecurity != "tls" {
+			return fmt.Errorf("relay rule %q trojan security %q is not supported", rule.ID, rule.TargetSecurity)
+		}
+		if rule.TargetAllowInsecure {
+			return fmt.Errorf("relay rule %q trojan allow-insecure is not supported", rule.ID)
+		}
+	case "shadowsocks":
+		if rule.TargetPassword == "" {
+			return fmt.Errorf("relay rule %q shadowsocks password is required", rule.ID)
+		}
+		method := rule.TargetMethod
+		if method == "" {
+			method = rule.TargetCipher
+		}
+		if !validRelayShadowsocksCipher(method) {
+			return fmt.Errorf("relay rule %q has unsupported shadowsocks cipher %q", rule.ID, method)
+		}
+		if rule.TargetPlugin != "" || rule.TargetPluginOpts != "" {
+			return fmt.Errorf("relay rule %q shadowsocks plugin is not supported", rule.ID)
+		}
+		if rule.TargetAllowInsecure {
+			return fmt.Errorf("relay rule %q shadowsocks allow-insecure is not supported", rule.ID)
+		}
+	}
+	return nil
+}
+
+func validRelayShadowsocksCipher(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "xchacha20-poly1305",
+		"aes-128-cfb", "aes-256-cfb", "chacha20", "chacha20-ietf",
+		"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305":
+		return true
+	default:
+		return false
+	}
 }
 
 func NodeFacingRelayRules(rules []types.NodeRelayRule) []types.NodeRelayRule {
@@ -642,6 +697,7 @@ func configRelayRules(values []config.NodeRelayRule) []types.NodeRelayRule {
 			Sort:                rule.Sort,
 			Remark:              rule.Remark,
 			ListenPort:          rule.ListenPort,
+			SidecarPort:         rule.SidecarPort,
 			Network:             rule.Network,
 			TargetAddress:       rule.TargetAddress,
 			TargetPort:          rule.TargetPort,
@@ -655,6 +711,10 @@ func configRelayRules(values []config.NodeRelayRule) []types.NodeRelayRule {
 			TargetXHTTPExtra:    rule.TargetXHTTPExtra,
 			TargetUUID:          rule.TargetUUID,
 			TargetPassword:      rule.TargetPassword,
+			TargetMethod:        rule.TargetMethod,
+			TargetCipher:        rule.TargetCipher,
+			TargetPlugin:        rule.TargetPlugin,
+			TargetPluginOpts:    rule.TargetPluginOpts,
 			TargetAllowInsecure: rule.TargetAllowInsecure,
 		})
 	}
