@@ -562,7 +562,7 @@ func sidecarRelayRules(rules []types.NodeRelayRule, groupID int64) []types.NodeR
 			mapped.TargetAddress = "127.0.0.1"
 			mapped.TargetPort = rule.SidecarPort
 			if mapped.TargetPort == 0 {
-				mapped.TargetPort = 31001 + index
+				mapped.TargetPort = 31001 + int((groupID-1)*100) + index
 			}
 			mapped.TargetSNI = ""
 			mapped.TargetTransport = "tcp"

@@ -277,6 +277,14 @@ func TestMergeSubscriptionRelayRulesMigratesExactLegacyDerivedRule(t *testing.T)
 	}
 }
 
+func TestSidecarRelayRulesUsesGroupPortRangeWhenPortIsUnassigned(t *testing.T) {
+	raw := types.NodeRelayRule{ID: "group-two", Enabled: true, ListenPort: 1943, TargetProtocol: "vless"}
+	got := sidecarRelayRules([]types.NodeRelayRule{raw}, 2)
+	if len(got) != 1 || got[0].TargetPort != 31101 {
+		t.Fatalf("group 2 target port = %#v, want 31101", got)
+	}
+}
+
 func TestRelaySubscriptionRulesRevisionIsStableAndTracksRuntimeChanges(t *testing.T) {
 	rules := []types.NodeRelayRule{{ID: "same", Enabled: true, ListenPort: 643, TargetProtocol: "vless", TargetAddress: "old.example", TargetPort: 443}}
 	first, err := relaySubscriptionRulesRevision(rules)

@@ -276,7 +276,7 @@ func TestSidecarRelayRulesMapsAnyTLSToLocalSOCKS(t *testing.T) {
 		t.Fatalf("mapped VLESS rule = %#v", got[1])
 	}
 	groupTwo := sidecarRelayRules(rules, 2)
-	if groupTwo[0].TargetPort != 31001 || groupTwo[1].TargetPort != 31002 {
+	if groupTwo[0].TargetPort != 31101 || groupTwo[1].TargetPort != 31102 {
 		t.Fatalf("server pool fallback = %#v", groupTwo)
 	}
 }
