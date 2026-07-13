@@ -24,9 +24,9 @@ func TestRelayNodeOwnershipDoesNotUseTags(t *testing.T) {
 	}
 }
 
-func TestValidateRelaySubscriptionRequestRejectsAutoUpdateAndInvalidURL(t *testing.T) {
-	if err := validateRelaySubscriptionRequest(true, "https://example.com/sub"); err == nil {
-		t.Fatal("auto_update=true accepted")
+func TestValidateRelaySubscriptionRequestAcceptsAutoUpdateAndRejectsInvalidURL(t *testing.T) {
+	if err := validateRelaySubscriptionRequest(true, "https://example.com/sub"); err != nil {
+		t.Fatalf("auto_update=true rejected: %v", err)
 	}
 	for _, raw := range []string{"httpx://example.com", "ftp://example.com", "https:example.com"} {
 		if err := validateRelaySubscriptionRequest(false, raw); err == nil {
@@ -133,7 +133,7 @@ func TestAssignSidecarPortsKeepsPortsStableAcrossReorderAndInsert(t *testing.T) 
 	}
 	newRules := []types.NodeRelayRule{{ID: "b"}, {ID: "c"}, {ID: "a"}}
 
-	got, err := assignSidecarPorts(newRules, oldRules, nil)
+	got, err := assignSidecarPorts(newRules, oldRules, nil, 1)
 	if err != nil {
 		t.Fatalf("assignSidecarPorts() error = %v", err)
 	}
@@ -146,12 +146,12 @@ func TestAssignSidecarPortsMigratesLegacyRulesByOldIndex(t *testing.T) {
 	oldRules := []types.NodeRelayRule{{ID: "a"}, {ID: "b"}}
 	newRules := []types.NodeRelayRule{{ID: "b"}, {ID: "a"}}
 
-	got, err := assignSidecarPorts(newRules, oldRules, nil)
+	got, err := assignSidecarPorts(newRules, oldRules, nil, 2)
 	if err != nil {
 		t.Fatalf("assignSidecarPorts() error = %v", err)
 	}
-	if got[0].SidecarPort != 31002 || got[1].SidecarPort != 31001 {
-		t.Fatalf("migrated ports = [%d %d], want [31002 31001]", got[0].SidecarPort, got[1].SidecarPort)
+	if got[0].SidecarPort != 31102 || got[1].SidecarPort != 31101 {
+		t.Fatalf("migrated ports = [%d %d], want [31102 31101]", got[0].SidecarPort, got[1].SidecarPort)
 	}
 }
 
@@ -160,26 +160,26 @@ func TestAssignSidecarPortsRejectsGroupOverCapacity(t *testing.T) {
 	for i := range rules {
 		rules[i].ID = fmt.Sprintf("rule-%d", i)
 	}
-	if _, err := assignSidecarPorts(rules, nil, nil); err == nil {
+	if _, err := assignSidecarPorts(rules, nil, nil, 1); err == nil {
 		t.Fatal("assignSidecarPorts() error = nil, want group capacity error")
 	}
 }
 
 func TestAssignSidecarPortsUsesServerWideOccupiedPool(t *testing.T) {
 	rules := []types.NodeRelayRule{{ID: "new"}}
-	got, err := assignSidecarPorts(rules, nil, map[int]struct{}{31001: {}, 31002: {}, 31101: {}})
+	got, err := assignSidecarPorts(rules, nil, map[int]struct{}{31001: {}, 31002: {}, 31101: {}}, 2)
 	if err != nil {
 		t.Fatalf("assignSidecarPorts() error = %v", err)
 	}
-	if got[0].SidecarPort != 31003 {
-		t.Fatalf("sidecar port = %d, want first server-wide free port 31003", got[0].SidecarPort)
+	if got[0].SidecarPort != 31102 {
+		t.Fatalf("sidecar port = %d, want first free group port 31102", got[0].SidecarPort)
 	}
 }
 
 func TestAssignSidecarPortsDoesNotReusePortOccupiedByAnotherGroup(t *testing.T) {
 	rules := []types.NodeRelayRule{{ID: "same"}}
 	oldRules := []types.NodeRelayRule{{ID: "same", SidecarPort: 31001}}
-	got, err := assignSidecarPorts(rules, oldRules, map[int]struct{}{31001: {}})
+	got, err := assignSidecarPorts(rules, oldRules, map[int]struct{}{31001: {}}, 1)
 	if err != nil {
 		t.Fatalf("assignSidecarPorts() error = %v", err)
 	}
@@ -274,6 +274,31 @@ func TestMergeSubscriptionRelayRulesMigratesExactLegacyDerivedRule(t *testing.T)
 	nearMatch.TargetPort++
 	if _, err := mergeSubscriptionRelayRules([]types.NodeRelayRule{nearMatch}, map[int64][]types.NodeRelayRule{7: {raw}}); err == nil || !strings.Contains(err.Error(), "legacy migration conflict") {
 		t.Fatalf("near-match migration error = %v, want conflict", err)
+	}
+}
+
+func TestMergeSubscriptionRelayRulesMigratesHistoricalGlobalFallback(t *testing.T) {
+	raw := types.NodeRelayRule{ID: "owned", Enabled: true, ListenPort: 1943, Network: "tcp,udp", TargetProtocol: "anytls"}
+	legacy := sidecarRelayRules([]types.NodeRelayRule{raw}, 2)[0]
+	legacy.ID = raw.ID
+	legacy.TargetPort = 31001
+
+	got, err := mergeSubscriptionRelayRules([]types.NodeRelayRule{legacy}, map[int64][]types.NodeRelayRule{2: {raw}})
+	if err != nil {
+		t.Fatalf("mergeSubscriptionRelayRules() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID != subscriptionRelayRuleID(2, raw.ID) || got[0].TargetPort != 31101 {
+		t.Fatalf("merged rules = %#v, want migrated group-aware rule", got)
+	}
+}
+
+func TestSidecarPortsForRulesAccountsForImplicitGroupRanges(t *testing.T) {
+	got := sidecarPortsForRules(2, []types.NodeRelayRule{{ID: "a"}, {ID: "b", SidecarPort: 32000}})
+	if _, ok := got[31101]; !ok {
+		t.Fatalf("implicit group port missing: %#v", got)
+	}
+	if _, ok := got[32000]; !ok {
+		t.Fatalf("explicit sidecar port missing: %#v", got)
 	}
 }
 

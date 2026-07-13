@@ -23,6 +23,7 @@ func QueryRelaySubscriptionGroupsHandler(svcCtx *svc.ServiceContext) app.Handler
 			c.String(consts.StatusUnauthorized, "Unauthorized")
 			return
 		}
+		adminserver.NewRelaySubscriptionGroupLogic(ctx, svcCtx).RefreshAutoUpdateGroups(serverID)
 		groups, err := adminserver.NewRelaySubscriptionGroupLogic(ctx, svcCtx).List(serverID)
 		if err != nil {
 			c.String(consts.StatusInternalServerError, err.Error())

@@ -174,6 +174,39 @@ func (l *RelaySubscriptionGroupLogic) Preview(id, serverID int64) (*types.Subscr
 	return resp, nil
 }
 
+// RefreshAutoUpdateGroups refreshes due subscription groups independently.
+func (l *RelaySubscriptionGroupLogic) RefreshAutoUpdateGroups(serverID int64) {
+	var rows []node.RelaySubscriptionGroup
+	if err := l.svcCtx.Store.DB().WithContext(l.ctx).
+		Where("server_id = ? AND enabled = ? AND auto_update = ?", serverID, true, true).
+		Find(&rows).Error; err != nil {
+		l.Errorf("load auto-update relay groups failed: %v", err)
+		return
+	}
+	now := time.Now()
+	for _, row := range rows {
+		interval := time.Duration(row.UpdateInterval) * time.Second
+		if interval <= 0 {
+			interval = 24 * time.Hour
+		}
+		if row.LastUpdatedAt != nil && now.Sub(*row.LastUpdatedAt) < interval {
+			continue
+		}
+		preview, err := l.Preview(row.Id, serverID)
+		if err == nil && len(preview.Rules) == 0 {
+			err = fmt.Errorf("subscription contains no supported relay rules")
+		}
+		if err == nil {
+			err = l.Apply(&types.RelaySubscriptionGroupApplyRequest{
+				Id: row.Id, ServerID: serverID, Rules: preview.Rules, PreviewToken: preview.PreviewToken,
+			}, serverID)
+		}
+		if err != nil {
+			l.Errorf("refresh relay subscription group %d failed: %v", row.Id, err)
+		}
+	}
+}
+
 func (l *RelaySubscriptionGroupLogic) Apply(req *types.RelaySubscriptionGroupApplyRequest, serverID int64) error {
 	unlock := lockRelaySubscriptionServer(serverID)
 	defer unlock()
@@ -204,7 +237,7 @@ func (l *RelaySubscriptionGroupLogic) Apply(req *types.RelaySubscriptionGroupApp
 		if err != nil {
 			return err
 		}
-		assignedRules, err := assignSidecarPorts(req.Rules, oldRules, occupiedPorts)
+		assignedRules, err := assignSidecarPorts(req.Rules, oldRules, occupiedPorts, row.Id)
 		if err != nil {
 			return xerr.NewErrCodeMsg(xerr.InvalidParams, err.Error())
 		}
@@ -507,9 +540,7 @@ func relayNodeIsOrphaned(item node.Node, groupID int64, currentRuleIDs map[strin
 }
 
 func validateRelaySubscriptionRequest(autoUpdate bool, rawURL string) error {
-	if autoUpdate {
-		return fmt.Errorf("auto_update is not supported")
-	}
+	_ = autoUpdate
 	parsed, err := url.ParseRequestURI(strings.TrimSpace(rawURL))
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return fmt.Errorf("subscription url must use http or https")
@@ -562,7 +593,7 @@ func sidecarRelayRules(rules []types.NodeRelayRule, groupID int64) []types.NodeR
 			mapped.TargetAddress = "127.0.0.1"
 			mapped.TargetPort = rule.SidecarPort
 			if mapped.TargetPort == 0 {
-				mapped.TargetPort = 31001 + int((groupID-1)*100) + index
+				mapped.TargetPort = sidecarFallbackPort(groupID, index)
 			}
 			mapped.TargetSNI = ""
 			mapped.TargetTransport = "tcp"
@@ -602,6 +633,10 @@ func mergeSubscriptionRelayRules(existing []types.NodeRelayRule, groups map[int6
 			}
 			candidate.ID = rules[index].ID
 			legacyOwnedRules[candidate] = struct{}{}
+			if rules[index].SidecarPort == 0 && groupID > 1 {
+				candidate.TargetPort = 31001 + index
+				legacyOwnedRules[candidate] = struct{}{}
+			}
 		}
 	}
 	manualRules := make([]types.NodeRelayRule, 0, len(existing))
@@ -733,7 +768,7 @@ func shouldRecordRelayHealthFailure(err error) bool {
 	return !errors.Is(err, errRelaySubscriptionRevisionMismatch)
 }
 
-func assignSidecarPorts(rules, oldRules []types.NodeRelayRule, occupied map[int]struct{}) ([]types.NodeRelayRule, error) {
+func assignSidecarPorts(rules, oldRules []types.NodeRelayRule, occupied map[int]struct{}, groupID int64) ([]types.NodeRelayRule, error) {
 	const poolStart, poolEnd = 31001, 61000
 	if len(rules) > poolEnd-poolStart+1 {
 		return nil, fmt.Errorf("subscription group supports at most %d relay rules", poolEnd-poolStart+1)
@@ -742,7 +777,7 @@ func assignSidecarPorts(rules, oldRules []types.NodeRelayRule, occupied map[int]
 	for index, rule := range oldRules {
 		port := rule.SidecarPort
 		if port == 0 {
-			port = poolStart + index
+			port = sidecarFallbackPort(groupID, index)
 		}
 		if rule.ID != "" && port >= poolStart && port <= poolEnd {
 			oldPorts[rule.ID] = port
@@ -765,18 +800,26 @@ func assignSidecarPorts(rules, oldRules []types.NodeRelayRule, occupied map[int]
 			assigned[index].SidecarPort = 0
 		}
 	}
-	nextPort := poolStart
+	nextPort := sidecarFallbackPort(groupID, 0)
+	if nextPort < poolStart || nextPort > poolEnd {
+		nextPort = poolStart
+	}
 	for index := range assigned {
 		if assigned[index].SidecarPort != 0 {
 			continue
 		}
-		for nextPort <= poolEnd {
+		found := false
+		for attempts := 0; attempts <= poolEnd-poolStart; attempts++ {
 			if _, exists := used[nextPort]; !exists {
+				found = true
 				break
 			}
 			nextPort++
+			if nextPort > poolEnd {
+				nextPort = poolStart
+			}
 		}
-		if nextPort > poolEnd {
+		if !found {
 			return nil, fmt.Errorf("server sidecar port pool is exhausted")
 		}
 		assigned[index].SidecarPort = nextPort
@@ -784,6 +827,24 @@ func assignSidecarPorts(rules, oldRules []types.NodeRelayRule, occupied map[int]
 		nextPort++
 	}
 	return assigned, nil
+}
+
+func sidecarFallbackPort(groupID int64, index int) int {
+	return 31001 + int((groupID-1)*100) + index
+}
+
+func sidecarPortsForRules(groupID int64, rules []types.NodeRelayRule) map[int]struct{} {
+	ports := make(map[int]struct{}, len(rules))
+	for index, rule := range rules {
+		port := rule.SidecarPort
+		if port == 0 {
+			port = sidecarFallbackPort(groupID, index)
+		}
+		if port >= 31001 && port <= 61000 {
+			ports[port] = struct{}{}
+		}
+	}
+	return ports
 }
 
 func validateSubscriptionRuntimeRules(rules []types.NodeRelayRule) error {
@@ -830,10 +891,8 @@ func (l *RelaySubscriptionGroupLogic) serverSidecarPorts(db *gorm.DB, serverID, 
 		if err := json.Unmarshal([]byte(group.Rules), &rules); err != nil {
 			return nil, fmt.Errorf("parse relay subscription group %d rules: %w", group.Id, err)
 		}
-		for _, rule := range rules {
-			if rule.SidecarPort >= 31001 && rule.SidecarPort <= 61000 {
-				occupied[rule.SidecarPort] = struct{}{}
-			}
+		for port := range sidecarPortsForRules(group.Id, rules) {
+			occupied[port] = struct{}{}
 		}
 	}
 	return occupied, nil

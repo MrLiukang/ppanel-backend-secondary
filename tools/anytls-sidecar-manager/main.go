@@ -947,7 +947,11 @@ func buildXrayConfig(rules []xrayRule) (string, error) {
 			if protocol == "trojan" && security == "" {
 				security = "tls"
 			}
-			stream = map[string]any{"network": item.Rule.TargetTransport, "security": security, "tlsSettings": map[string]any{"serverName": item.Rule.TargetSNI}}
+			transport := item.Rule.TargetTransport
+			if transport == "" {
+				transport = "tcp"
+			}
+			stream = map[string]any{"network": transport, "security": security, "tlsSettings": map[string]any{"serverName": item.Rule.TargetSNI}}
 			if strings.EqualFold(item.Rule.TargetTransport, "xhttp") || strings.EqualFold(item.Rule.TargetTransport, "splithttp") {
 				stream["xhttpSettings"] = map[string]any{"path": item.Rule.TargetPath, "mode": item.Rule.TargetXHTTPMode}
 			}
