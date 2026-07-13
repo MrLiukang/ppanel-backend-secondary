@@ -349,6 +349,55 @@ func TestProcessIdentityMatchKills(t *testing.T) {
 	}
 }
 
+func TestRuntimeStateRequiresResetForLegacyStateAndPID(t *testing.T) {
+	rulesDir := t.TempDir()
+	state := map[string]runtimeState{"g1-r0-old": {Digest: "legacy"}}
+	reset, err := runtimeStateRequiresReset(state, rulesDir)
+	if err != nil || !reset {
+		t.Fatalf("legacy state reset=%v err=%v", reset, err)
+	}
+
+	state["g1-r0-old"] = runtimeState{Digest: "current", Port: 31001}
+	if err := os.WriteFile(filepath.Join(rulesDir, "g1-r0-old.pid"), []byte("123"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reset, err = runtimeStateRequiresReset(state, rulesDir)
+	if err != nil || !reset {
+		t.Fatalf("legacy PID reset=%v err=%v", reset, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(rulesDir, "g1-r0-old.pid"), []byte("123 456 /config/rules/g1-r0-old.json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reset, err = runtimeStateRequiresReset(state, rulesDir)
+	if err != nil || reset {
+		t.Fatalf("current runtime reset=%v err=%v", reset, err)
+	}
+}
+
+func TestResetLegacyRuntimePreservesFilesWhenContainerRemovalFails(t *testing.T) {
+	rulesDir := t.TempDir()
+	tracked := filepath.Join(rulesDir, "legacy.pid")
+	if err := os.WriteFile(tracked, []byte("123"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := resetLegacyRuntime(rulesDir, func() error { return errors.New("docker unavailable") })
+	if err == nil || !strings.Contains(err.Error(), "docker unavailable") {
+		t.Fatalf("reset error = %v", err)
+	}
+	if _, err := os.Stat(tracked); err != nil {
+		t.Fatalf("legacy tracking file removed after failed container removal: %v", err)
+	}
+
+	if err := resetLegacyRuntime(rulesDir, func() error { return nil }); err != nil {
+		t.Fatalf("reset legacy runtime: %v", err)
+	}
+	if entries, err := os.ReadDir(rulesDir); err != nil || len(entries) != 0 {
+		t.Fatalf("rules directory entries=%v err=%v", entries, err)
+	}
+}
+
 func TestStopTrackedRuleReturnsErrorAndKeepsFilesWhenProcessDoesNotStop(t *testing.T) {
 	rulesDir := t.TempDir()
 	key := "g1-rule"

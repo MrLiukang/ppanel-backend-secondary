@@ -120,6 +120,16 @@ func reconcile(client *http.Client, baseURL, serverID, secret, hostRoot, dockerR
 	if err != nil {
 		return err
 	}
+	reset, err := runtimeStateRequiresReset(state, rulesDir)
+	if err != nil {
+		return err
+	}
+	if reset {
+		if err := resetLegacyRuntime(rulesDir, removeSidecarContainer); err != nil {
+			return fmt.Errorf("reset legacy relay runtime: %w", err)
+		}
+		state = make(map[string]runtimeState)
+	}
 	statePorts := make(map[string]int, len(state))
 	for key, item := range state {
 		statePorts[key] = item.Port
@@ -672,6 +682,42 @@ func inspectProcess(pid string) (processIdentity, error) {
 
 func processIdentityMatches(record, actual processIdentity) bool {
 	return record.PID == actual.PID && record.StartTime != "" && record.StartTime == actual.StartTime && record.Marker != "" && strings.Contains(actual.Marker, record.Marker)
+}
+
+func runtimeStateRequiresReset(state map[string]runtimeState, rulesDir string) (bool, error) {
+	for key, item := range state {
+		if item.Port <= 0 {
+			return true, nil
+		}
+		raw, err := os.ReadFile(filepath.Join(rulesDir, key+".pid"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, err
+		}
+		if _, err := parseProcessIdentity(string(raw)); err != nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func resetLegacyRuntime(rulesDir string, removeContainer func() error) error {
+	if err := removeContainer(); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(rulesDir); err != nil {
+		return err
+	}
+	return os.MkdirAll(rulesDir, 0750)
+}
+
+func removeSidecarContainer() error {
+	if !containerExists(sidecarName) {
+		return nil
+	}
+	return docker("rm", "-f", sidecarName)
 }
 
 func stopMatchingProcess(record processIdentity, inspect func(string) (processIdentity, error), kill func(string) error) (bool, error) {
